@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name            = "aura_watermark"
+version         = "0.1.0"
+description     = "AURA: A Stegaformer-Based Scalable Deep Audio Watermark with Extreme Robustness (ICASSP 2026)"
+readme          = "README.md"
+requires-python = ">=3.10"
+license         = { text = "MIT" }
+authors         = [
+    { name = "Sathwik Kolli", email = "gayathrikolli62@gmail.com" },
+]
+keywords        = ["audio watermarking", "deep learning", "conformer", "FiLM", "ICASSP"]
+classifiers     = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+
+dependencies = [
+    "torch>=2.1.0",
+    "torchaudio>=2.1.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["aura_watermark*"]
+
+[tool.pytest.ini_options]
+testpaths    = ["tests"]
+python_files = ["test_*.py"]
