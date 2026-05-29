@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-Emilia selective download — stream HuggingFace shards, apply DNSMOS +
-duration + speaker-cap filters, save only English utterances.
+Emilia selective download — reads parquet shards directly via huggingface_hub
++ pyarrow. NO datasets library, NO torchcodec, NO FFmpeg required.
 
-KEY FACTS about amphion/Emilia-Dataset on HuggingFace:
-  - Only ONE config exists: 'default'  (not separate 'EN', 'ZH' etc.)
-  - Language is a FIELD inside each sample, not a separate config
-  - We stream 'default' and filter samples where language == 'EN'
-  - Dataset is gated: must accept terms and login with huggingface-cli
+Strategy:
+  1. List all parquet shards in the HF repo using list_repo_files()
+  2. Download one shard at a time (~200-800 MB each)
+  3. Read with pyarrow — audio bytes are a plain binary column, no decoding
+  4. Apply filters (language=EN, DNSMOS, duration, speaker cap)
+  5. Save passing audio with soundfile, update manifest CSV
+  6. Delete the shard file to reclaim space
+  7. Repeat until 2,500 h collected
 
 REQUIREMENTS:
-  pip install datasets huggingface_hub soundfile tqdm pandas requests
-  huggingface-cli login            # one-time, saves token to ~/.cache/
+  pip install huggingface_hub pyarrow soundfile pandas tqdm
+  huggingface-cli login    (accept dataset terms at HF first)
 
-Usage (on Great Lakes login node):
+Usage:
   python download_emilia.py \\
       --output-dir /nfs/turbo/umd-hafiz/issf_server_data/emilia \\
       --manifest   /nfs/turbo/umd-hafiz/issf_server_data/emilia/manifests/emilia_raw.csv
@@ -31,6 +34,7 @@ import argparse
 import csv
 import io
 import os
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -42,42 +46,32 @@ DUR_MIN_S     = 3.0
 DUR_MAX_S     = 30.0
 TARGET_H      = 2500.0
 SPEAKER_CAP_H = 1.0
-TARGET_LANG   = "EN"           # English utterances only
+TARGET_LANG   = "EN"
 
-# ── HuggingFace config ────────────────────────────────────────────────────────
-HF_REPO   = "amphion/Emilia-Dataset"
-HF_CONFIG = "default"          # Only config available — language filtered by field
+HF_REPO = "amphion/Emilia-Dataset"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Token helpers
+# Token
 # ─────────────────────────────────────────────────────────────────────────────
 
 def resolve_token(cli_token: str | None) -> str | None:
-    """
-    Token resolution priority:
-      1. --hf-token argument
-      2. HF_TOKEN environment variable
-      3. Token saved by `huggingface-cli login` (~/.cache/huggingface/token)
-    """
     if cli_token:
         return cli_token
     if os.environ.get("HF_TOKEN"):
         return os.environ["HF_TOKEN"]
-    # Try modern API first (huggingface_hub >= 0.20)
     try:
         from huggingface_hub import get_token
-        cached = get_token()
-        if cached:
-            return cached
-    except ImportError:
+        t = get_token()
+        if t:
+            return t
+    except Exception:
         pass
-    # Fall back to legacy API
     try:
         from huggingface_hub import HfFolder
-        cached = HfFolder.get_token()
-        if cached:
-            return cached
+        t = HfFolder.get_token()
+        if t:
+            return t
     except Exception:
         pass
     return None
@@ -87,80 +81,110 @@ def resolve_token(cli_token: str | None) -> str | None:
 # Metadata extractors — handle all known Emilia schema variants
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_dnsmos(sample: dict) -> float:
-    for key in ("dnsmos", "DNSMOS", "dns_mos", "mos"):
-        v = sample.get(key)
-        if v is not None and not isinstance(v, dict):
-            return float(v)
-    for key in ("dnsmos", "DNSMOS"):
-        v = sample.get(key)
-        if isinstance(v, dict):
-            ovrl = v.get("OVRL") or v.get("ovrl") or v.get("overall")
-            if ovrl is not None:
-                return float(ovrl)
-    ovrl = sample.get("dnsmos_ovrl") or sample.get("ovrl")
-    if ovrl is not None:
-        return float(ovrl)
-    return -1.0
+def _str(v) -> str:
+    return str(v) if v is not None else ""
 
 
-def get_duration(sample: dict) -> float:
-    # Prefer explicit metadata field (always present in Emilia JSON)
-    for key in ("duration", "dur", "length"):
-        v = sample.get(key)
-        if v is not None:
-            return float(v)
-    # Fallback: compute from decoded array (only if decode=True path)
-    audio = sample.get("audio") or {}
-    if isinstance(audio, dict):
-        arr = audio.get("array")
-        sr  = audio.get("sampling_rate", 48_000)
-        if arr is not None and hasattr(arr, "__len__"):
-            return len(arr) / sr
-    return 0.0
-
-
-def get_speaker(sample: dict) -> str:
-    for key in ("speaker", "spk", "speaker_id", "spkid"):
-        v = sample.get(key)
-        if v is not None:
-            return str(v)
-    return "UNK"
-
-
-def get_language(sample: dict) -> str:
-    """Return normalised 2-letter language code: 'en-US' → 'EN'."""
+def get_language(row: dict) -> str:
     for key in ("language", "lang", "locale"):
-        v = sample.get(key)
-        if v is not None:
+        v = row.get(key)
+        if v:
             return str(v).split("-")[0].upper()[:2]
     return "UNK"
 
 
+def get_dnsmos(row: dict) -> float:
+    for key in ("dnsmos", "DNSMOS", "dns_mos", "mos", "dnsmos_ovrl", "ovrl"):
+        v = row.get(key)
+        if v is None:
+            continue
+        if isinstance(v, dict):
+            ovrl = v.get("OVRL") or v.get("ovrl") or v.get("overall")
+            if ovrl is not None:
+                return float(ovrl)
+        else:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return -1.0
+
+
+def get_duration(row: dict) -> float:
+    for key in ("duration", "dur", "length"):
+        v = row.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+def get_speaker(row: dict) -> str:
+    for key in ("speaker", "spk", "speaker_id", "spkid"):
+        v = row.get(key)
+        if v:
+            return str(v)
+    return "UNK"
+
+
+def get_utt_id(row: dict) -> str:
+    for key in ("id", "utt_id", "utterance_id", "file"):
+        v = row.get(key)
+        if v:
+            return str(v)
+    return ""
+
+
+def get_audio_bytes(row: dict) -> bytes | None:
+    """
+    Extract raw audio bytes from a parquet row.
+
+    Emilia stores audio as:
+      {"bytes": b"...", "path": "filename.mp3"}   ← struct column
+    or sometimes as a plain bytes column.
+    """
+    audio = row.get("audio") or row.get("wav") or row.get("audio_bytes")
+    if audio is None:
+        return None
+    if isinstance(audio, bytes):
+        return audio
+    if isinstance(audio, dict):
+        b = audio.get("bytes") or audio.get("data")
+        if isinstance(b, bytes):
+            return b
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Audio save
+# Audio save (soundfile only — no torchcodec needed)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_audio_array(array, sr: int, out_path: Path) -> bool:
+def save_audio_bytes(raw_bytes: bytes, out_path: Path) -> bool:
+    """Decode audio bytes with soundfile and save as 16-bit PCM WAV."""
     try:
         import soundfile as sf
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        sf.write(str(out_path), array, sr, subtype="PCM_16")
-        return True
-    except Exception:
-        return False
-
-
-def save_audio_bytes(audio_bytes: bytes, out_path: Path) -> bool:
-    try:
-        import soundfile as sf
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with io.BytesIO(audio_bytes) as buf:
+        with io.BytesIO(raw_bytes) as buf:
             data, sr = sf.read(buf, dtype="float32", always_2d=False)
         sf.write(str(out_path), data, sr, subtype="PCM_16")
         return True
     except Exception:
         return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parquet shard list
+# ─────────────────────────────────────────────────────────────────────────────
+
+def list_parquet_shards(token: str) -> list[str]:
+    """Return all .parquet file paths in the HF repo, sorted."""
+    from huggingface_hub import list_repo_files
+    files = list(list_repo_files(HF_REPO, repo_type="dataset", token=token))
+    shards = sorted(f for f in files if f.endswith(".parquet"))
+    print(f"Found {len(shards)} parquet shards in {HF_REPO}")
+    return shards
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,151 +194,185 @@ def save_audio_bytes(audio_bytes: bytes, out_path: Path) -> bool:
 def download_emilia(
     output_dir:    Path,
     manifest_path: Path,
-    hf_token:      str | None,
+    hf_token:      str,
     resume:        bool,
+    tmp_dir:       Path,
 ) -> None:
-    try:
-        from datasets import load_dataset
-    except ImportError:
-        raise ImportError("Run: pip install datasets")
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
 
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Resume state ──────────────────────────────────────────────────────────
-    saved_paths:   set  = set()
-    speaker_hours: dict = {}
-    total_saved_h       = 0.0
+    saved_paths:      set  = set()
+    speaker_hours:    dict = {}
+    processed_shards: set  = set()
+    total_saved_h          = 0.0
+
+    progress_path = manifest_path.parent / "emilia_progress.txt"
 
     if resume and manifest_path.exists():
-        df_ex = pd.read_csv(manifest_path)
+        df_ex         = pd.read_csv(manifest_path)
         saved_paths   = set(df_ex["path"].tolist())
         speaker_hours = (df_ex.groupby("speaker")["duration_s"].sum() / 3600).to_dict()
         total_saved_h = df_ex["duration_s"].sum() / 3600
-        print(f"Resuming: {len(saved_paths):,} utterances already saved "
+        print(f"Resume: {len(saved_paths):,} utterances already saved "
               f"({total_saved_h:.1f} h)")
 
-    # ── Open manifest ─────────────────────────────────────────────────────────
+    if resume and progress_path.exists():
+        processed_shards = set(progress_path.read_text().splitlines())
+        print(f"Resume: {len(processed_shards)} shards already processed")
+
+    # ── Manifest file ─────────────────────────────────────────────────────────
     write_header = not (resume and manifest_path.exists())
-    manifest_file   = open(manifest_path, "a", newline="", encoding="utf-8")
-    manifest_writer = csv.writer(manifest_file)
+    mf   = open(manifest_path, "a", newline="", encoding="utf-8")
+    mcsv = csv.writer(mf)
     if write_header:
-        manifest_writer.writerow(["path", "duration_s", "speaker", "language", "dnsmos"])
+        mcsv.writerow(["path", "duration_s", "speaker", "language", "dnsmos"])
 
-    print(f"\nStreaming {HF_REPO} config='{HF_CONFIG}' (target: {TARGET_H:.0f} h EN)")
-    print(f"Filters: DNSMOS>={DNSMOS_MIN}  dur {DUR_MIN_S}-{DUR_MAX_S}s  "
-          f"speaker<={SPEAKER_CAP_H}h  lang={TARGET_LANG}")
+    # ── Shard list ────────────────────────────────────────────────────────────
+    shards = list_parquet_shards(hf_token)
 
-    saved   = 0
-    skipped_lang  = 0
-    skipped_other = 0
+    print(f"\nTarget: {TARGET_H:.0f} h EN  |  DNSMOS>={DNSMOS_MIN}  "
+          f"|  dur {DUR_MIN_S}-{DUR_MAX_S}s  |  speaker<={SPEAKER_CAP_H}h\n")
+
+    saved_total    = len(saved_paths)
+    skipped_lang   = 0
+    skipped_filter = 0
+    skipped_audio  = 0
 
     try:
-        ds = load_dataset(
-            HF_REPO,
-            name              = HF_CONFIG,
-            split             = "train",
-            streaming         = True,
-            token             = hf_token,
-            trust_remote_code = True,
-        )
-
-        # Disable automatic audio decoding — avoids torchcodec / FFmpeg dependency.
-        # Returns raw bytes instead; we decode with soundfile ourselves.
-        try:
-            from datasets import Audio as HFAudio
-            ds = ds.cast_column("audio", HFAudio(decode=False))
-        except Exception:
-            pass  # column might not exist or cast may fail; proceed anyway
-
-        pbar = tqdm(desc="Streaming Emilia", unit="utt")
-
-        for sample in ds:
+        for shard_idx, shard_path in enumerate(shards):
             if total_saved_h >= TARGET_H:
+                print(f"Target {TARGET_H:.0f} h reached — stopping.")
                 break
 
-            pbar.update(1)
-
-            # ── Language filter (must be EN) ──────────────────────────────────
-            language = get_language(sample)
-            if language != TARGET_LANG:
-                skipped_lang += 1
+            if shard_path in processed_shards:
                 continue
 
-            # ── Extract metadata ──────────────────────────────────────────────
-            dnsmos   = get_dnsmos(sample)
-            duration = get_duration(sample)
-            speaker  = get_speaker(sample)
+            shard_name = Path(shard_path).name
+            print(f"[{shard_idx+1}/{len(shards)}] {shard_name}  "
+                  f"(saved so far: {total_saved_h:.1f} h)")
 
-            # ── Quality / duration / DNSMOS filters ───────────────────────────
-            if dnsmos < DNSMOS_MIN:
-                skipped_other += 1
-                continue
-            if not (DUR_MIN_S <= duration <= DUR_MAX_S):
-                skipped_other += 1
-                continue
-            if speaker_hours.get(speaker, 0.0) >= SPEAKER_CAP_H:
-                skipped_other += 1
-                continue
-
-            # ── Build output path ─────────────────────────────────────────────
-            utt_id   = str(sample.get("id") or sample.get("utt_id") or
-                           f"{speaker}_{saved:09d}")
-            rel_path = Path("EN") / speaker[:12] / f"{utt_id}.wav"
-            out_path = output_dir / rel_path
-
-            if str(out_path) in saved_paths:
-                continue  # already saved in previous run
-
-            # ── Save audio ────────────────────────────────────────────────────
-            audio_data = sample.get("audio") or sample.get("wav")
-            ok = False
-            if isinstance(audio_data, dict):
-                # decode=False path: {"bytes": b"...", "path": "..."}
-                raw = audio_data.get("bytes")
-                if raw is not None:
-                    ok = save_audio_bytes(raw, out_path)
-                else:
-                    # decode=True path: {"array": np.ndarray, "sampling_rate": int}
-                    arr = audio_data.get("array")
-                    sr  = int(audio_data.get("sampling_rate", 48_000))
-                    if arr is not None:
-                        ok = save_audio_array(arr, sr, out_path)
-            elif isinstance(audio_data, bytes):
-                ok = save_audio_bytes(audio_data, out_path)
-
-            if not ok:
-                skipped_other += 1
+            # ── Download shard ────────────────────────────────────────────────
+            try:
+                local_shard = hf_hub_download(
+                    repo_id   = HF_REPO,
+                    filename  = shard_path,
+                    repo_type = "dataset",
+                    token     = hf_token,
+                    local_dir = str(tmp_dir),
+                    local_dir_use_symlinks = False,
+                )
+            except Exception as e:
+                print(f"  Download failed: {e} — skipping shard")
                 continue
 
-            # ── Update state ──────────────────────────────────────────────────
-            dur_h                    = duration / 3600
-            speaker_hours[speaker]   = speaker_hours.get(speaker, 0.0) + dur_h
-            total_saved_h           += dur_h
-            saved                   += 1
-            saved_paths.add(str(out_path))
+            # ── Read parquet with pyarrow ─────────────────────────────────────
+            try:
+                table = pq.read_table(local_shard)
+            except Exception as e:
+                print(f"  Parquet read failed: {e} — skipping")
+                Path(local_shard).unlink(missing_ok=True)
+                continue
 
-            manifest_writer.writerow([str(out_path), round(duration, 3),
-                                      speaker, language, round(dnsmos, 4)])
-            manifest_file.flush()
+            col_names = table.schema.names
+            n_rows    = len(table)
 
-            if saved % 500 == 0:
+            shard_saved   = 0
+            shard_skipped = 0
+
+            pbar = tqdm(total=n_rows, desc=f"  {shard_name}", unit="utt", leave=False)
+
+            for i in range(n_rows):
+                if total_saved_h >= TARGET_H:
+                    break
+
+                # Convert pyarrow row to plain Python dict
+                row = {col: table[col][i].as_py() for col in col_names}
+
+                pbar.update(1)
+
+                # ── Language filter ───────────────────────────────────────────
+                lang = get_language(row)
+                if lang != TARGET_LANG:
+                    skipped_lang += 1
+                    continue
+
+                # ── Quality filters ───────────────────────────────────────────
+                dnsmos   = get_dnsmos(row)
+                duration = get_duration(row)
+                speaker  = get_speaker(row)
+
+                if dnsmos < DNSMOS_MIN:
+                    skipped_filter += 1
+                    continue
+                if not (DUR_MIN_S <= duration <= DUR_MAX_S):
+                    skipped_filter += 1
+                    continue
+                if speaker_hours.get(speaker, 0.0) >= SPEAKER_CAP_H:
+                    skipped_filter += 1
+                    continue
+
+                # ── Build output path ─────────────────────────────────────────
+                utt_id   = get_utt_id(row) or f"{speaker}_{saved_total:09d}"
+                out_path = output_dir / "EN" / speaker[:12] / f"{utt_id}.wav"
+
+                if str(out_path) in saved_paths:
+                    continue
+
+                # ── Extract + save audio ──────────────────────────────────────
+                audio_bytes = get_audio_bytes(row)
+                if not audio_bytes:
+                    skipped_audio += 1
+                    continue
+
+                if not save_audio_bytes(audio_bytes, out_path):
+                    skipped_audio += 1
+                    continue
+
+                # ── Update state ──────────────────────────────────────────────
+                dur_h                  = duration / 3600
+                speaker_hours[speaker] = speaker_hours.get(speaker, 0.0) + dur_h
+                total_saved_h         += dur_h
+                saved_total           += 1
+                saved_paths.add(str(out_path))
+                shard_saved           += 1
+
+                mcsv.writerow([str(out_path), round(duration, 3),
+                               speaker, lang, round(dnsmos, 4)])
+                mf.flush()
+
                 pbar.set_postfix({
-                    "EN_saved": f"{saved}",
-                    "total_h":  f"{total_saved_h:.1f}",
-                    "non_EN_skip": f"{skipped_lang}",
+                    "saved_h": f"{total_saved_h:.1f}",
+                    "shard":   f"{shard_saved}",
                 })
 
-        pbar.close()
+            pbar.close()
+            print(f"  Shard done: saved={shard_saved}  skipped_lang={shard_skipped}")
+
+            # ── Delete shard to free space ────────────────────────────────────
+            try:
+                Path(local_shard).unlink()
+            except Exception:
+                pass
+
+            # ── Mark shard as done ────────────────────────────────────────────
+            processed_shards.add(shard_path)
+            with open(progress_path, "a") as pf:
+                pf.write(shard_path + "\n")
 
     finally:
-        manifest_file.close()
+        mf.close()
 
     print(f"\n{'='*55}")
     print(f"EMILIA DOWNLOAD COMPLETE")
-    print(f"  EN utterances saved: {saved:,}  ({total_saved_h:.1f} h)")
-    print(f"  Skipped (non-EN):    {skipped_lang:,}")
-    print(f"  Skipped (filter):    {skipped_other:,}")
+    print(f"  EN utterances saved: {saved_total:,}  ({total_saved_h:.1f} h)")
+    print(f"  Skipped non-EN:      {skipped_lang:,}")
+    print(f"  Skipped by filter:   {skipped_filter:,}")
+    print(f"  Skipped (no audio):  {skipped_audio:,}")
     print(f"  Manifest:            {manifest_path}")
     print(f"{'='*55}")
 
@@ -323,30 +381,36 @@ def download_emilia(
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Selective Emilia EN download via HuggingFace streaming",
+        description="Selective Emilia EN download via pyarrow (no torchcodec)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("--output-dir", required=True)
-    ap.add_argument("--manifest",   required=True)
+    ap.add_argument("--output-dir", required=True,
+                    help="Root directory to save audio files")
+    ap.add_argument("--manifest",   required=True,
+                    help="CSV manifest path to write")
     ap.add_argument("--hf-token",   default=None,
-                    help="HF token (auto-loaded from cache if not set)")
-    ap.add_argument("--resume",     action="store_true")
+                    help="HuggingFace token (auto-loaded from cache if omitted)")
+    ap.add_argument("--tmp-dir",    default="/tmp/emilia_shards",
+                    help="Temp directory for downloading parquet shards")
+    ap.add_argument("--resume",     action="store_true",
+                    help="Skip already-processed shards and saved utterances")
     args = ap.parse_args()
 
     token = resolve_token(args.hf_token)
     if not token:
         print("ERROR: No HuggingFace token found.")
-        print("  Run: huggingface-cli login")
-        print("  Or:  export HF_TOKEN=hf_xxxxxxxxxxxx")
+        print("  Run:    huggingface-cli login")
+        print("  Or set: export HF_TOKEN=hf_xxxx")
         raise SystemExit(1)
 
-    print(f"HF token: {'*' * 8}{token[-4:] if len(token) > 4 else '****'}")
+    print(f"HF token: {'*'*8}{token[-4:]}")
 
     download_emilia(
         output_dir    = Path(args.output_dir),
         manifest_path = Path(args.manifest),
         hf_token      = token,
         resume        = args.resume,
+        tmp_dir       = Path(args.tmp_dir),
     )
 
 
