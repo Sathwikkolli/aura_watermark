@@ -1,9 +1,9 @@
 """
 AURA Step 8 — Dataset Pipeline.
 
-Two training corpora:
-  Emilia    ~2500 hr multilingual speech  (amphion/Emilia-Dataset on HuggingFace)
-  FMA-Large  ~880 hr music               (freemusicarchive.org/music/FMA)
+Two training corpora (~2 500 hr each):
+  Emilia  ~2 500 hr multilingual speech  (amphion/Emilia-Dataset on HuggingFace)
+  FMA     ~2 500 hr music                (FMA full or equivalent mirror — not fma_large alone)
 
 Expected directory layouts after download:
 
@@ -12,11 +12,12 @@ Expected directory layouts after download:
       EN/  ZH/  DE/  FR/  JA/  KO/
         *.mp3  (or *.wav / *.flac)
 
-  FMA-Large:
+  FMA (~2 500 hr — use fma_full or a curated mirror, not only fma_large ~880 hr):
     <fma_root>/
-      fma_large/
-        000/ 001/ ... 155/
+      fma_full/          # preferred (mdeff/fma fma_full.zip)
+        000/ 001/ ... /
           *.mp3
+      # or fma_large/ for smaller smoke tests only
 
 Both datasets are subclasses of AudioSegmentDataset which:
   1. Scans root directories for supported audio files (.wav/.mp3/.flac/.ogg)
@@ -26,7 +27,7 @@ Both datasets are subclasses of AudioSegmentDataset which:
   5. Generates a fresh random 32-bit message
 
 AURACombinedDataset mixes the two corpora with a configurable
-speech:music ratio (default 75:25 — typical for watermark training data).
+speech:music ratio (default 50:50 — equal hour budgets).
 
 build_dataloaders() splits each corpus into train/val (fixed seed),
 returns (train_loader, val_loader) ready for AURATrainer.
@@ -264,6 +265,62 @@ class AudioSegmentDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FMA directory resolution
+# ─────────────────────────────────────────────────────────────────────────────
+
+FMA_SUBSET_CHOICES = ("auto", "fma_full", "fma_large", "root")
+
+
+def resolve_fma_directory(root: PathLike, subset: str = "auto") -> Path:
+    """
+    Locate the FMA audio tree under ``root``.
+
+    Args:
+        root:   path passed as ``--fma-root``
+        subset: ``auto`` | ``fma_full`` | ``fma_large`` | ``root``
+                ``auto`` prefers ``fma_full`` (target ~2 500 hr), then ``fma_large``.
+
+    Returns:
+        Directory to scan recursively for audio files.
+
+    Raises:
+        FileNotFoundError: if the requested layout is missing.
+        ValueError: invalid ``subset`` name.
+    """
+    root = Path(root)
+    subset = subset.lower().strip()
+
+    if subset not in FMA_SUBSET_CHOICES:
+        raise ValueError(
+            f"fma_subset must be one of {FMA_SUBSET_CHOICES}, got {subset!r}"
+        )
+
+    if subset == "root":
+        return root
+
+    if subset == "fma_large":
+        d = root / "fma_large"
+        return d if d.is_dir() else root
+
+    if subset == "fma_full":
+        d = root / "fma_full"
+        if d.is_dir():
+            return d
+        raise FileNotFoundError(
+            f"FMA full subset not found at {d}. "
+            "Download fma_full from https://github.com/mdeff/fma (~2 500+ hr). "
+            "For smoke tests only, use --fma-subset fma_large or auto."
+        )
+
+    # auto: prefer full corpus for paper-scale training
+    for name in ("fma_full", "fma_large"):
+        d = root / name
+        if d.is_dir():
+            return d
+    return root
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Emilia speech dataset
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -336,53 +393,61 @@ class EmiliaDataset(AudioSegmentDataset):
 
 class FMADataset(AudioSegmentDataset):
     """
-    Free Music Archive (FMA) large subset (~880 hr).
+    Free Music Archive (FMA) music corpus (~2 500 hr target for AURA training).
 
-    Download: https://github.com/mdeff/fma  →  fma_large.zip (~90 GB)
+    Use ``fma_full`` (or a ~2 500 hr mirror), not ``fma_large`` alone (~880 hr).
+
+    Download: https://github.com/mdeff/fma
+      - ``fma_full.zip`` — full corpus (~2 500+ hr; recommended)
+      - ``fma_large.zip`` — smaller subset (~880 hr; smoke tests only)
 
     Expected directory layout::
 
         <root>/
-          fma_large/
-            000/ 001/ ... 155/
+          fma_full/          # preferred
+            000/ 001/ ... /
               *.mp3
+          # or fma_large/ for debugging
 
     Args:
-        root:     path containing the ``fma_large`` subdirectory
-        cfg:      AURAConfig
-        split:    ``"train"`` or ``"val"``
-        val_frac: fraction of files reserved for validation
-        seed:     random seed for the train/val split
+        root:       path containing ``fma_full`` / ``fma_large`` or flat audio tree
+        cfg:        AURAConfig (uses ``cfg.dataset.fma_subset`` when subset is None)
+        subset:     ``auto`` | ``fma_full`` | ``fma_large`` | ``root``
+        split:      ``"train"`` or ``"val"``
+        val_frac:   fraction of files reserved for validation
+        seed:       random seed for the train/val split
     """
 
     def __init__(
         self,
         root:     PathLike,
         cfg:      AURAConfig,
+        subset:   Optional[str] = None,
         split:    str = "train",
         val_frac: float = 0.01,
         seed:     int = 42,
         **kwargs,
     ):
         root     = Path(root)
-        fma_dir  = root / "fma_large"
-        if not fma_dir.is_dir():
-            # Accept the root directly if fma_large subfolder is absent
-            fma_dir = root
+        subset   = subset if subset is not None else cfg.dataset.fma_subset
+        fma_dir  = resolve_fma_directory(root, subset)
 
         all_files = scan_audio_files(fma_dir)
 
         if not all_files:
             raise FileNotFoundError(
                 f"No audio files found under {fma_dir}. "
-                "Check that fma_large.zip has been extracted."
+                "Extract fma_full (or fma_large for tests) under --fma-root. "
+                f"subset={subset!r}, root={root}"
             )
 
         paths = _train_val_split(all_files, split, val_frac, seed)
         super().__init__(paths, cfg, **kwargs)
 
-        self.root  = root
-        self.split = split
+        self.root   = root
+        self.subset = subset
+        self.fma_dir = fma_dir
+        self.split  = split
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -401,7 +466,7 @@ class AURACombinedDataset(Dataset):
         speech_dataset: EmiliaDataset (or any AudioSegmentDataset)
         music_dataset:  FMADataset   (or any AudioSegmentDataset)
         speech_ratio:   fraction of clips drawn from the speech dataset
-                        (default 0.75)
+                        (default 0.5 — equal Emilia / FMA hour budgets)
         total_clips:    virtual epoch length (default: max of the two datasets)
     """
 
@@ -409,7 +474,7 @@ class AURACombinedDataset(Dataset):
         self,
         speech_dataset: AudioSegmentDataset,
         music_dataset:  AudioSegmentDataset,
-        speech_ratio:   float = 0.75,
+        speech_ratio:   float = 0.5,
         total_clips:    Optional[int] = None,
     ):
         assert 0.0 < speech_ratio < 1.0, "speech_ratio must be in (0, 1)"
@@ -516,7 +581,8 @@ def build_dataloaders(
     cfg:          AURAConfig,
     emilia_root:  Optional[PathLike] = None,
     fma_root:     Optional[PathLike] = None,
-    speech_ratio: float = 0.75,
+    speech_ratio: Optional[float] = None,
+    fma_subset:   Optional[str] = None,
     batch_size:   Optional[int] = None,
     num_workers:  int = 4,
     pin_memory:   bool = True,
@@ -527,14 +593,16 @@ def build_dataloaders(
     Build train and validation DataLoaders for AURA.
 
     At least one of ``emilia_root`` or ``fma_root`` must be provided.
-    If both are provided, the combined 75:25 speech:music dataset is used
-    for training; validation uses the individual corpora separately.
+    If both are provided, a combined speech:music dataset is used for training
+    (default 50:50 — ~2 500 hr Emilia + ~2 500 hr FMA); validation concatenates
+    both corpora.
 
     Args:
         cfg:          AURAConfig
         emilia_root:  path to Emilia dataset root (optional)
-        fma_root:     path to FMA-large root (optional)
-        speech_ratio: Emilia fraction in combined dataset (default 0.75)
+        fma_root:     path to FMA root with ``fma_full/`` or ``fma_large/`` (optional)
+        speech_ratio: Emilia fraction (default: ``cfg.dataset.speech_ratio``, 0.5)
+        fma_subset:   FMA tree selector (default: ``cfg.dataset.fma_subset``, ``auto``)
         batch_size:   clips per GPU per step (default: cfg.training.batch_size)
         num_workers:  DataLoader worker processes
         pin_memory:   pin CPU tensors to GPU memory for faster transfer
@@ -546,6 +614,11 @@ def build_dataloaders(
     """
     if emilia_root is None and fma_root is None:
         raise ValueError("At least one of emilia_root or fma_root must be provided.")
+
+    speech_ratio = (
+        speech_ratio if speech_ratio is not None else cfg.dataset.speech_ratio
+    )
+    fma_subset = fma_subset if fma_subset is not None else cfg.dataset.fma_subset
 
     bs = batch_size or cfg.training.batch_size
 
@@ -561,10 +634,16 @@ def build_dataloaders(
 
     if fma_root is not None:
         train_datasets.append(
-            FMADataset(fma_root, cfg, split="train", val_frac=val_frac, seed=seed)
+            FMADataset(
+                fma_root, cfg, subset=fma_subset,
+                split="train", val_frac=val_frac, seed=seed,
+            )
         )
         val_datasets.append(
-            FMADataset(fma_root, cfg, split="val", val_frac=val_frac, seed=seed)
+            FMADataset(
+                fma_root, cfg, subset=fma_subset,
+                split="val", val_frac=val_frac, seed=seed,
+            )
         )
 
     # ── Training dataset ──────────────────────────────────────────────────

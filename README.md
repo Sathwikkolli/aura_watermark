@@ -72,7 +72,9 @@ AURA embeds an imperceptible 32-bit binary watermark into audio by modulating th
 ```
 aura_watermark/
 ├── config.py          — All hyperparameters (STFTConfig, ConformerConfig,
-│                        AttackConfig, LossConfig, TrainingConfig, …)
+│                        DatasetConfig, AttackConfig, LossConfig, TrainingConfig, …)
+├── dataset.py         — Emilia + FMA loaders, combined 50:50 mix
+├── trainer.py         — AURATrainer (two-stage loop, AMP, checkpoints)
 ├── stft.py            — STFTProcessor  [B,1,T] → (magnitude, phase)
 │                        ISTFTReconstructor (magnitude, phase) → [B,1,T]
 ├── conformer.py       — FiLMGenerator, ConformerBlock, StegaformerBackbone
@@ -81,6 +83,10 @@ aura_watermark/
 ├── attacks.py         — 20-attack AttackLayer + AdaptiveCurriculum
 ├── discriminator.py   — BigVGANDiscriminator (MPD + MSSTFTD)
 └── losses.py          — AURALoss: BCE, MultiResSTFT, Adv, FM, NMR
+```
+
+```
+train.py               — CLI entry point (Step 9)
 ```
 
 ```
@@ -207,7 +213,23 @@ Expected: **130+ tests, all passing.**
 
 ---
 
-## Training (Planned — Step 7)
+## Training Data
+
+| Corpus | Hours | Source |
+|--------|-------|--------|
+| Emilia | ~2 500 | `huggingface-cli download amphion/Emilia-Dataset` |
+| FMA | ~2 500 | [mdeff/fma](https://github.com/mdeff/fma) **`fma_full`** (not `fma_large` ~880 h alone) |
+
+Combined training defaults to **50:50** speech:music (`cfg.dataset.speech_ratio = 0.5`).
+
+```bash
+python train.py \
+  --emilia-root /data/emilia \
+  --fma-root    /data/fma \
+  --fma-subset  fma_full
+```
+
+## Training
 
 Two-stage training:
 

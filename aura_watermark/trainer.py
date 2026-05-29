@@ -20,7 +20,7 @@ Double-encoding (paper Section 3.4):
   The detector then tries to recover the *second* message.
 
 Adaptive curriculum:
-  AttackLayer.record(attack_name, bit_loss) updates rolling statistics.
+  AttackLayer.curriculum.record(attack_name, bit_loss) updates rolling statistics.
   Curriculum probabilities are re-normalised after every batch.
 
 Checkpoint:
@@ -88,7 +88,7 @@ def compute_lr(step: int, cfg: AURAConfig) -> float:
     """
     tc = cfg.training
     if step < tc.warmup_steps:
-        return tc.learning_rate * max(step, 1) / tc.warmup_steps
+        return tc.learning_rate * (step + 1) / tc.warmup_steps
     progress = min(
         (step - tc.warmup_steps) / max(tc.total_steps - tc.warmup_steps, 1),
         1.0,
@@ -420,7 +420,7 @@ class AURATrainer:
 
         # ── Update curriculum ──────────────────────────────────────────────
         bit_loss_for_curriculum = gen_comp.msg.item()
-        self.attack_layer.record(attack_name, bit_loss_for_curriculum)
+        self.attack_layer.curriculum.record(attack_name, bit_loss_for_curriculum)
 
         # ── Accumulation counter ───────────────────────────────────────────
         self._accum_count += 1

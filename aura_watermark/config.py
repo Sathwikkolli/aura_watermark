@@ -107,6 +107,26 @@ class LossConfig:
 
 
 @dataclass
+class DatasetConfig:
+    """
+    Training corpora (paper-scale): ~2 500 hr Emilia speech + ~2 500 hr FMA music.
+
+    When both corpora are used, ``speech_ratio`` defaults to 0.5 so each
+    optimizer step sees speech and music with equal probability.
+    """
+
+    emilia_hours: float = 2_500.0
+    fma_hours: float = 2_500.0
+
+    # Fraction of combined-training clips drawn from Emilia (speech).
+    # Default 0.5 matches equal hour budgets above.
+    speech_ratio: float = 0.5
+
+    # FMA tree under ``--fma-root``: ``auto`` tries fma_full, then fma_large, then root.
+    fma_subset: str = "auto"   # auto | fma_full | fma_large | root
+
+
+@dataclass
 class TrainingConfig:
     # --- confirmed from paper ---
     optimizer: str = "adam"
@@ -222,4 +242,5 @@ class AURAConfig:
     attack: AttackConfig = field(default_factory=AttackConfig)
     multi_res_stft: MultiResSTFTConfig = field(default_factory=MultiResSTFTConfig)
     loss: LossConfig = field(default_factory=LossConfig)
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)

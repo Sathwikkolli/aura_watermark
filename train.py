@@ -87,15 +87,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     data.add_argument("--emilia-root",  type=str, default=None,
                       help="Path to Emilia dataset root (EN/ZH/DE/FR/JA/KO subfolders).")
     data.add_argument("--fma-root",     type=str, default=None,
-                      help="Path to FMA-large root (fma_large/000-155 subfolders).")
+                      help="Path to FMA root (fma_full/ for ~2500 hr; fma_large/ for smoke tests).")
+    data.add_argument("--fma-subset",   type=str, default=None,
+                      choices=["auto", "fma_full", "fma_large", "root"],
+                      help="FMA tree under --fma-root (default: auto → fma_full, then fma_large).")
     data.add_argument("--synthetic",    action="store_true",
                       help="Use in-memory synthetic data (no corpus required).")
     data.add_argument("--n-train",      type=int, default=2048,
                       help="Synthetic training clips (only with --synthetic).")
     data.add_argument("--n-val",        type=int, default=256,
                       help="Synthetic validation clips (only with --synthetic).")
-    data.add_argument("--speech-ratio", type=float, default=0.75,
-                      help="Fraction of training clips drawn from speech (Emilia).")
+    data.add_argument("--speech-ratio", type=float, default=None,
+                      help="Fraction of training clips from Emilia (default: 0.5 for 2500h+2500h).")
     data.add_argument("--num-workers",  type=int, default=4,
                       help="DataLoader worker processes.")
     data.add_argument("--val-frac",     type=float, default=0.01,
@@ -384,16 +387,29 @@ def train(args: argparse.Namespace) -> None:
         if args.emilia_root is None and args.fma_root is None:
             log.error("Provide --emilia-root and/or --fma-root, or use --synthetic.")
             sys.exit(1)
+        speech_ratio = (
+            args.speech_ratio
+            if args.speech_ratio is not None
+            else cfg.dataset.speech_ratio
+        )
+        fma_subset = args.fma_subset or cfg.dataset.fma_subset
+
         train_loader, val_loader = build_dataloaders(
             cfg,
             emilia_root  = args.emilia_root,
             fma_root     = args.fma_root,
-            speech_ratio = args.speech_ratio,
+            speech_ratio = speech_ratio,
+            fma_subset   = fma_subset,
             batch_size   = cfg.training.batch_size,
             num_workers  = args.num_workers,
             val_frac     = args.val_frac,
         )
-        log.info("Train loader: %d batches/epoch", len(train_loader))
+        log.info(
+            "Train loader: %d batches/epoch  speech_ratio=%.2f  fma_subset=%s",
+            len(train_loader),
+            speech_ratio,
+            fma_subset,
+        )
 
     # ── Models ────────────────────────────────────────────────────────────
     log.info("Instantiating models…")
