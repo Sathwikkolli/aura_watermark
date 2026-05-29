@@ -15,18 +15,19 @@
 #SBATCH --cpus-per-task=40
 #SBATCH --mem=120G
 #SBATCH --time=06:00:00
+#SBATCH --gres=gpu:1
 #SBATCH --output=logs/fma_scan_%j.log
 #SBATCH --account=hafiz_root
 
 set -euo pipefail
 
 STORE=/nfs/turbo/umd-hafiz/issf_server_data
-SCRIPTS=$(dirname "$0")
+SCRIPTS="${SLURM_SUBMIT_DIR}/scripts/dataset"
 FMA_DIR="$STORE/fma"
 MANIFEST_DIR="$FMA_DIR/manifests"
 mkdir -p "$MANIFEST_DIR" logs
 
-conda activate asd
+conda activate aura
 
 echo "[$(date '+%F %T')] Node: $(hostname)"
 echo "[$(date '+%F %T')] Checking FMA directories"

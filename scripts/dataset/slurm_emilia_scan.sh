@@ -11,19 +11,20 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
 #SBATCH --time=05:00:00
+#SBATCH --gres=gpu:1
 #SBATCH --output=logs/emilia_scan_%j.log
 #SBATCH --account=hafiz_root          # ← confirm with: sacctmgr show user $USER
 
 set -euo pipefail
 
 STORE=/nfs/turbo/umd-hafiz/issf_server_data
-SCRIPTS=$(dirname "$0")
+SCRIPTS="${SLURM_SUBMIT_DIR}/scripts/dataset"
 mkdir -p "$STORE/emilia/manifests" logs
 
 echo "[$(date '+%F %T')] Node: $(hostname)"
 echo "[$(date '+%F %T')] Starting Emilia scan (32 workers)"
 
-conda activate asd
+conda activate aura
 
 # ── Phase 1a: Scan all JSON files ─────────────────────────────────────────────
 python "$SCRIPTS/scan_emilia.py" \

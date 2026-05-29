@@ -19,10 +19,10 @@
 set -euo pipefail
 
 STORE=/nfs/turbo/umd-hafiz/issf_server_data
-REPO=/home/ksathwik/aura_watermark       # ← adjust to your repo path
+REPO="${SLURM_SUBMIT_DIR}"
 mkdir -p logs
 
-conda activate asd
+conda activate aura
 
 echo "[$(date '+%F %T')] Node: $(hostname)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
