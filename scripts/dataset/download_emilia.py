@@ -64,6 +64,15 @@ def resolve_token(cli_token: str | None) -> str | None:
         return cli_token
     if os.environ.get("HF_TOKEN"):
         return os.environ["HF_TOKEN"]
+    # Try modern API first (huggingface_hub >= 0.20)
+    try:
+        from huggingface_hub import get_token
+        cached = get_token()
+        if cached:
+            return cached
+    except ImportError:
+        pass
+    # Fall back to legacy API
     try:
         from huggingface_hub import HfFolder
         cached = HfFolder.get_token()
