@@ -105,10 +105,12 @@ def get_dnsmos(sample: dict) -> float:
 
 
 def get_duration(sample: dict) -> float:
+    # Prefer explicit metadata field (always present in Emilia JSON)
     for key in ("duration", "dur", "length"):
         v = sample.get(key)
         if v is not None:
             return float(v)
+    # Fallback: compute from decoded array (only if decode=True path)
     audio = sample.get("audio") or {}
     if isinstance(audio, dict):
         arr = audio.get("array")
@@ -217,6 +219,14 @@ def download_emilia(
             trust_remote_code = True,
         )
 
+        # Disable automatic audio decoding — avoids torchcodec / FFmpeg dependency.
+        # Returns raw bytes instead; we decode with soundfile ourselves.
+        try:
+            from datasets import Audio as HFAudio
+            ds = ds.cast_column("audio", HFAudio(decode=False))
+        except Exception:
+            pass  # column might not exist or cast may fail; proceed anyway
+
         pbar = tqdm(desc="Streaming Emilia", unit="utt")
 
         for sample in ds:
@@ -260,10 +270,16 @@ def download_emilia(
             audio_data = sample.get("audio") or sample.get("wav")
             ok = False
             if isinstance(audio_data, dict):
-                arr = audio_data.get("array")
-                sr  = int(audio_data.get("sampling_rate", 48_000))
-                if arr is not None:
-                    ok = save_audio_array(arr, sr, out_path)
+                # decode=False path: {"bytes": b"...", "path": "..."}
+                raw = audio_data.get("bytes")
+                if raw is not None:
+                    ok = save_audio_bytes(raw, out_path)
+                else:
+                    # decode=True path: {"array": np.ndarray, "sampling_rate": int}
+                    arr = audio_data.get("array")
+                    sr  = int(audio_data.get("sampling_rate", 48_000))
+                    if arr is not None:
+                        ok = save_audio_array(arr, sr, out_path)
             elif isinstance(audio_data, bytes):
                 ok = save_audio_bytes(audio_data, out_path)
 
