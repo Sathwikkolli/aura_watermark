@@ -197,12 +197,14 @@ def download_fma(
     print(f"Target : {target_h:.0f} h | dur {DUR_MIN_S}–{DUR_MAX_S} s "
           f"| genre cap {MAX_H_PER_GENRE} h\n")
 
+    from datasets import Audio
     ds = load_dataset(
         HF_REPO,
         split="train",
         streaming=True,
-        trust_remote_code=True,
     )
+    # Return raw bytes instead of decoded arrays — avoids torchcodec/FFmpeg dependency
+    ds = ds.cast_column("audio", Audio(decode=False))
 
     skip_resume = skip_dur = skip_genre = skip_audio = 0
 
