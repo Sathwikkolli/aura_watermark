@@ -167,18 +167,23 @@ def download_fma(
     saved_count        = 0
 
     if resume and manifest_path.exists():
-        df_ex = pd.read_csv(manifest_path)
-        df_ex["duration_s"] = pd.to_numeric(
-            df_ex["duration_s"], errors="coerce"
-        ).fillna(0.0)
-        saved_ids     = set(df_ex["track_id"].astype(str).tolist())
-        genre_hours   = (
-            df_ex.groupby("genre_top")["duration_s"].sum() / 3600
-        ).to_dict()
-        total_saved_h = df_ex["duration_s"].sum() / 3600
-        saved_count   = len(saved_ids)
-        print(f"Resume: {saved_count:,} tracks already saved "
-              f"({total_saved_h:.1f} h)")
+        try:
+            df_ex = pd.read_csv(manifest_path)
+            if df_ex.empty or "track_id" not in df_ex.columns:
+                raise ValueError("empty or missing columns")
+            df_ex["duration_s"] = pd.to_numeric(
+                df_ex["duration_s"], errors="coerce"
+            ).fillna(0.0)
+            saved_ids     = set(df_ex["track_id"].astype(str).tolist())
+            genre_hours   = (
+                df_ex.groupby("genre_top")["duration_s"].sum() / 3600
+            ).to_dict()
+            total_saved_h = df_ex["duration_s"].sum() / 3600
+            saved_count   = len(saved_ids)
+            print(f"Resume: {saved_count:,} tracks already saved "
+                  f"({total_saved_h:.1f} h)")
+        except (pd.errors.EmptyDataError, ValueError):
+            print("Manifest exists but is empty/corrupt — starting fresh.")
 
     # ── Manifest file ─────────────────────────────────────────────────────────
     write_header = not (resume and manifest_path.exists())
