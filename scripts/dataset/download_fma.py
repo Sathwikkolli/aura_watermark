@@ -1,370 +1,326 @@
 #!/usr/bin/env python3
 """
-FMA selective download — three-stage pipeline:
+FMA selective download via HuggingFace streaming.
 
-  Stage 1: Download fma_metadata.zip (~342 MB, fast)
-  Stage 2: Curate track list from metadata (CPU only, seconds)
-  Stage 3: Download individual MP3s for selected tracks in parallel
+Source  : benjamin-paine/free-music-archive-full  (ungated, no login needed)
+Mirrors : same 106 k tracks as mdeff/fma fma_full.zip — full-length audio
 
-WHY INDIVIDUAL TRACKS instead of fma_full.zip:
-  fma_full.zip = 879 GB. We need ~2,500 h ≈ all of fma_full.
-  But many tracks are corrupt / silent / too short to pass quality filters.
-  Downloading per-track lets us:
-    - Skip tracks we know are bad from metadata (saves bandwidth)
-    - Parallelize with 16-32 connections (much faster than one serial download)
-    - Resume trivially (re-run script, already-downloaded files are skipped)
-    - Stay under 600 GB if only ~80% of tracks pass quality filter
+Strategy:
+  Stream one Parquet shard at a time from HuggingFace (no 879 GB zip).
+  For every track inspect duration + genre BEFORE writing audio to disk.
+  Stop once TARGET_H hours of passing audio are saved.
+  Write a manifest CSV compatible with curate_fma.py and the AURA dataset loader.
 
-TRACK DOWNLOAD URLS:
-  FMA stores all tracks at:
-    https://files.freemusicarchive.org/storage-freemusicarchive-org/tracks/{6-digit-id}.mp3
-  This URL pattern is stable and confirmed from the FMA dataset GitHub.
-  The local path mirrors FMA's own 3-digit subdirectory structure:
-    fma_full/000/000002.mp3
-    fma_full/001/001234.mp3
-    ...
+Filters applied during streaming:
+  • Duration   10 s – 1 800 s
+  • Genre cap  ≤ 300 h per top-level genre  (prevents Rock/Electronic domination)
+  • Global cap 2 500 h total
 
-REQUIREMENTS:
-  pip install pandas tqdm requests
+Output layout (identical to fma_full.zip extraction):
+  <output_dir>/
+    fma_full/
+      000/  000002.mp3
+      001/  001234.mp3
+      …
 
-Usage (on Great Lakes):
-  # Stage 1+2: metadata download and curation (fast, login node ok)
-  python download_fma.py metadata \\
-      --fma-dir  /nfs/turbo/umd-hafiz/issf_server_data/fma
+Manifest CSV columns:
+  path · duration_s · genre_top · track_id
 
-  # Stage 3: parallel audio download (submit as SLURM job)
-  python download_fma.py audio \\
-      --fma-dir      /nfs/turbo/umd-hafiz/issf_server_data/fma \\
-      --track-list   /nfs/turbo/umd-hafiz/issf_server_data/fma/manifests/fma_selected_ids.txt \\
-      --connections  32 \\
-      --resume
+Resume:
+  Pass --resume to skip tracks already in the manifest.
+  The HuggingFace dataset is ordered, so streaming restarts from shard 0
+  but already-seen track IDs are skipped in O(1) via a set.
+
+REQUIREMENTS (all in the aura conda env):
+  pip install datasets soundfile pandas tqdm
+
+Usage:
+  python download_fma.py \\
+      --output-dir /nfs/turbo/umd-hafiz/issf_server_data/fma \\
+      --manifest   /nfs/turbo/umd-hafiz/issf_server_data/fma/manifests/fma_raw.csv
+
+  # Resume after preemption:
+  python download_fma.py ... --resume
 """
 
+from __future__ import annotations
+
 import argparse
-import os
-import subprocess
+import csv
+import io
 import sys
-import time
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
+import soundfile as sf
 from tqdm import tqdm
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────────────
-
-METADATA_URL = "https://zenodo.org/record/1476463/files/fma_metadata.zip"
-# Confirmed working base URL for FMA audio files
-FMA_AUDIO_BASE = "https://files.freemusicarchive.org/storage-freemusicarchive-org/tracks"
-
-# Curation thresholds (pre-filter from metadata — final quality filter is done
-# after download in scan_fma.py / curate_fma.py)
+# ── Filter constants ──────────────────────────────────────────────────────────
 DUR_MIN_S       = 10.0
-DUR_MAX_S       = 1800.0
+DUR_MAX_S       = 1_800.0
 MAX_H_PER_GENRE = 300.0
-TARGET_H        = 2500.0
+TARGET_H        = 2_500.0
+
+HF_REPO = "benjamin-paine/free-music-archive-full"
+
+# ── Candidate column names (the HF dataset uses FMA's original CSV headers) ───
+# duration
+_DUR_KEYS    = ("track_duration", "duration", "track.duration",
+                "duration_s", "length")
+# genre
+_GENRE_KEYS  = ("track_genre_top", "genre_top", "genre", "track.genre_top",
+                "top_genre")
+# track id
+_ID_KEYS     = ("track_id", "id", "track.id", "tid")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fma_path(fma_root: Path, track_id: int) -> Path:
-    """fma_root/000/000002.mp3 for track_id=2"""
-    subdir = f"{track_id:06d}"[:3]
-    return fma_root / subdir / f"{track_id:06d}.mp3"
+def _get(sample: dict, keys: tuple, default=None):
+    """Return the first non-None value found among candidate keys."""
+    for k in keys:
+        v = sample.get(k)
+        if v is not None:
+            return v
+    return default
 
 
-def fma_url(track_id: int) -> str:
-    return f"{FMA_AUDIO_BASE}/{track_id:06d}.mp3"
+def fma_path(output_dir: Path, track_id: int) -> Path:
+    """
+    Mirror FMA's 3-digit subdirectory structure.
+      track_id=2      → fma_full/000/000002.mp3
+      track_id=1234   → fma_full/001/001234.mp3
+    """
+    tid_str = f"{track_id:06d}"
+    return output_dir / "fma_full" / tid_str[:3] / f"{tid_str}.mp3"
 
 
-def download_track(track_id: int, out_path: Path, retries: int = 3) -> bool:
-    """Download a single FMA track MP3. Returns True on success."""
-    if out_path.exists() and out_path.stat().st_size > 10_000:
-        return True   # already downloaded
+def save_audio(audio_data, out_path: Path) -> tuple[bool, float]:
+    """
+    Write audio from a HuggingFace Audio feature to disk.
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    url = fma_url(track_id)
-    tmp = out_path.with_suffix(".tmp")
+    HF Audio columns arrive as one of two forms:
+      A) {"bytes": b"<raw mp3/wav bytes>", "path": "..."}  — undecoded
+      B) {"array": np.ndarray, "sampling_rate": int}       — decoded
 
-    for attempt in range(retries):
-        try:
-            import requests
-            resp = requests.get(url, stream=True, timeout=60)
-            if resp.status_code == 404:
-                return False    # track genuinely doesn't exist
-            resp.raise_for_status()
+    Returns (success: bool, duration_s: float).
+    """
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
 
-            with open(tmp, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    f.write(chunk)
+        if isinstance(audio_data, dict):
+            raw = audio_data.get("bytes")
+            arr = audio_data.get("array")
+            sr  = audio_data.get("sampling_rate", 44_100)
 
-            tmp.rename(out_path)
-            return True
+            if raw:
+                # Write raw bytes directly (likely already MP3)
+                out_path.write_bytes(raw)
+                try:
+                    with io.BytesIO(raw) as buf:
+                        info = sf.info(buf)
+                    return True, info.duration
+                except Exception:
+                    # Can't read duration from bytes — fall back to 0 (caller uses metadata)
+                    return True, 0.0
 
-        except Exception:
-            if tmp.exists():
-                tmp.unlink()
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)
+            if arr is not None:
+                # Decoded float array — save as 16-bit PCM WAV
+                wav_path = out_path.with_suffix(".wav")
+                sf.write(str(wav_path), arr, sr, subtype="PCM_16")
+                return True, len(arr) / max(sr, 1)
 
-    return False
+        return False, 0.0
+
+    except Exception as exc:
+        # Silently skip corrupt/unreadable audio
+        _ = exc
+        return False, 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 1: Download + extract metadata
+# Main download loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def stage_metadata(fma_dir: Path):
-    """Download and extract fma_metadata.zip (~342 MB)."""
-    fma_dir.mkdir(parents=True, exist_ok=True)
-    meta_dir = fma_dir / "fma_metadata"
-
-    if (meta_dir / "tracks.csv").exists():
-        print(f"fma_metadata already present at {meta_dir}")
-        return
-
-    zip_path = fma_dir / "fma_metadata.zip"
-
-    print(f"Downloading fma_metadata.zip (~342 MB) …")
-    cmd = [
-        "aria2c",
-        f"--dir={fma_dir}",
-        "--out=fma_metadata.zip",
-        "--max-connection-per-server=4",
-        "--split=4",
-        "--check-certificate=false",
-        "--auto-file-renaming=false",
-        "--continue=true",
-        METADATA_URL,
-    ]
-    # Fallback to wget if aria2c not available
-    if subprocess.run(["which", "aria2c"],
-                      capture_output=True).returncode != 0:
-        print("aria2c not found — falling back to wget")
-        cmd = ["wget", "-c", "-O", str(zip_path), METADATA_URL]
-
-    ret = subprocess.run(cmd)
-    if ret.returncode != 0:
-        print("Download failed. Check your internet connection.")
+def download_fma(
+    output_dir:    Path,
+    manifest_path: Path,
+    resume:        bool,
+    target_h:      float = TARGET_H,
+) -> None:
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print("ERROR: 'datasets' library not found.")
+        print("  Run: pip install datasets")
         sys.exit(1)
 
-    print("Extracting …")
-    subprocess.run(["unzip", "-q", str(zip_path), "-d", str(fma_dir)],
-                   check=True)
-    zip_path.unlink()
-    print(f"Metadata extracted to {meta_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # ── Resume state ──────────────────────────────────────────────────────────
+    saved_ids:    set  = set()
+    genre_hours:  dict = {}
+    total_saved_h      = 0.0
+    saved_count        = 0
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage 2: Curate track list from metadata
-# ─────────────────────────────────────────────────────────────────────────────
+    if resume and manifest_path.exists():
+        df_ex = pd.read_csv(manifest_path)
+        df_ex["duration_s"] = pd.to_numeric(
+            df_ex["duration_s"], errors="coerce"
+        ).fillna(0.0)
+        saved_ids     = set(df_ex["track_id"].astype(str).tolist())
+        genre_hours   = (
+            df_ex.groupby("genre_top")["duration_s"].sum() / 3600
+        ).to_dict()
+        total_saved_h = df_ex["duration_s"].sum() / 3600
+        saved_count   = len(saved_ids)
+        print(f"Resume: {saved_count:,} tracks already saved "
+              f"({total_saved_h:.1f} h)")
 
-def stage_curate(fma_dir: Path, track_list_path: Path, seed: int = 42):
-    """
-    Read tracks.csv, apply duration + genre cap filters,
-    write selected track IDs to track_list_path.
-    """
-    tracks_csv = fma_dir / "fma_metadata" / "tracks.csv"
-    if not tracks_csv.exists():
-        print(f"tracks.csv not found. Run: python download_fma.py metadata first.")
-        sys.exit(1)
+    # ── Manifest file ─────────────────────────────────────────────────────────
+    write_header = not (resume and manifest_path.exists())
+    mf   = open(manifest_path, "a", newline="", encoding="utf-8")
+    mcsv = csv.writer(mf)
+    if write_header:
+        mcsv.writerow(["path", "duration_s", "genre_top", "track_id"])
 
-    print(f"Loading {tracks_csv} …")
-    tracks = pd.read_csv(tracks_csv, index_col=0, header=[0, 1])
+    # ── Stream dataset ────────────────────────────────────────────────────────
+    print(f"\nStreaming: {HF_REPO}")
+    print(f"Target : {target_h:.0f} h | dur {DUR_MIN_S}–{DUR_MAX_S} s "
+          f"| genre cap {MAX_H_PER_GENRE} h\n")
 
-    # Build flat dataframe
-    df = pd.DataFrame({
-        "track_id":   tracks.index.astype(int),
-        "duration_s": tracks[("track", "duration")].fillna(0).astype(float).values,
-        "genre_top":  tracks[("track", "genre_top")].fillna("Unknown").astype(str).values,
-    })
-
-    print(f"Total tracks in metadata: {len(df):,}  "
-          f"({df['duration_s'].sum()/3600:.0f} h)")
-
-    # ── Duration filter ───────────────────────────────────────────────────
-    df = df[(df["duration_s"] >= DUR_MIN_S) & (df["duration_s"] <= DUR_MAX_S)]
-    print(f"After duration filter [{DUR_MIN_S}s, {DUR_MAX_S}s]:  "
-          f"{len(df):,}  ({df['duration_s'].sum()/3600:.0f} h)")
-
-    # ── Genre cap ─────────────────────────────────────────────────────────
-    def cap_genre(grp):
-        grp = grp.sample(frac=1, random_state=seed)
-        cum = grp["duration_s"].cumsum() / 3600
-        return grp[cum <= MAX_H_PER_GENRE]
-
-    df = df.groupby("genre_top", group_keys=False).apply(cap_genre)
-
-    # ── Trim to target ────────────────────────────────────────────────────
-    df = df.sample(frac=1, random_state=seed)
-    cum = df["duration_s"].cumsum() / 3600
-    df  = df[cum <= TARGET_H]
-
-    total_h = df["duration_s"].sum() / 3600
-    print(f"Selected for download: {len(df):,} tracks  ({total_h:.0f} h)")
-
-    track_list_path.parent.mkdir(parents=True, exist_ok=True)
-    df[["track_id", "duration_s", "genre_top"]].to_csv(
-        track_list_path, index=False
+    ds = load_dataset(
+        HF_REPO,
+        split="train",
+        streaming=True,
+        trust_remote_code=True,
     )
-    print(f"Track list written to {track_list_path}")
 
-    # Also print what we expect genre-wise
-    genre_h = df.groupby("genre_top")["duration_s"].sum().sort_values(ascending=False) / 3600
-    print("\nExpected genre distribution:")
-    for g, h in genre_h.head(10).items():
-        print(f"  {g:<22s}  {h:5.0f} h")
+    skip_resume = skip_dur = skip_genre = skip_audio = 0
+
+    try:
+        pbar = tqdm(ds, unit="track", dynamic_ncols=True)
+        for sample in pbar:
+            if total_saved_h >= target_h:
+                print(f"\nTarget {target_h:.0f} h reached — stopping.")
+                break
+
+            # ── Extract metadata ──────────────────────────────────────────────
+            raw_id   = _get(sample, _ID_KEYS, default="UNK")
+            track_id = str(raw_id)
+            duration = float(_get(sample, _DUR_KEYS, default=0.0) or 0.0)
+            genre    = str(_get(sample, _GENRE_KEYS, default="Unknown") or "Unknown")
+
+            # ── Resume skip ───────────────────────────────────────────────────
+            if track_id in saved_ids:
+                skip_resume += 1
+                continue
+
+            # ── Duration filter ───────────────────────────────────────────────
+            if not (DUR_MIN_S <= duration <= DUR_MAX_S):
+                skip_dur += 1
+                continue
+
+            # ── Genre cap ─────────────────────────────────────────────────────
+            if genre_hours.get(genre, 0.0) >= MAX_H_PER_GENRE:
+                skip_genre += 1
+                continue
+
+            # ── Audio ─────────────────────────────────────────────────────────
+            audio_data = sample.get("audio")
+            if audio_data is None:
+                skip_audio += 1
+                continue
+
+            # Integer track_id for path construction
+            try:
+                tid_int = int(raw_id)
+            except (ValueError, TypeError):
+                tid_int = abs(hash(track_id)) % 999_999
+
+            out_path = fma_path(output_dir, tid_int)
+            ok, actual_dur = save_audio(audio_data, out_path)
+
+            if not ok:
+                skip_audio += 1
+                continue
+
+            # Prefer measured duration over metadata duration
+            if actual_dur > 0.0:
+                duration = actual_dur
+
+            # ── Update state ──────────────────────────────────────────────────
+            dur_h = duration / 3600
+            genre_hours[genre]  = genre_hours.get(genre, 0.0) + dur_h
+            total_saved_h      += dur_h
+            saved_count        += 1
+            saved_ids.add(track_id)
+
+            mcsv.writerow([str(out_path), round(duration, 3), genre, track_id])
+            mf.flush()
+
+            pbar.set_postfix(
+                saved=f"{total_saved_h:.1f}h",
+                tracks=saved_count,
+                skip_dur=skip_dur,
+                skip_genre=skip_genre,
+            )
+
+    finally:
+        mf.close()
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print("FMA DOWNLOAD COMPLETE")
+    print(f"  Tracks saved     : {saved_count:,}  ({total_saved_h:.1f} h)")
+    print(f"  Skipped (resume) : {skip_resume:,}")
+    print(f"  Skipped (dur)    : {skip_dur:,}")
+    print(f"  Skipped (genre)  : {skip_genre:,}")
+    print(f"  Skipped (audio)  : {skip_audio:,}")
+    print(f"  Manifest         : {manifest_path}")
+    print()
+
+    # Genre distribution summary
+    print("Genre distribution:")
+    for g, h in sorted(genre_hours.items(), key=lambda x: -x[1]):
+        print(f"  {g:<22s}  {h:6.1f} h")
+    print(f"{'='*60}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage 3: Parallel audio download
-# ─────────────────────────────────────────────────────────────────────────────
-
-def stage_audio(
-    fma_dir: Path,
-    track_list_path: Path,
-    connections: int,
-    resume: bool,
-):
-    """
-    Download MP3 files for all tracks in track_list_path using a thread pool.
-    Each thread downloads one track at a time. With 32 threads this typically
-    saturates a 1 Gbps NFS link (~50-100 MB/s, ~3-6 TB/day).
-    """
-    if not track_list_path.exists():
-        print(f"Track list not found: {track_list_path}")
-        print("Run: python download_fma.py curate --fma-dir … first")
-        sys.exit(1)
-
-    df = pd.read_csv(track_list_path)
-    track_ids = df["track_id"].astype(int).tolist()
-    fma_root  = fma_dir / "fma_full"
-    fma_root.mkdir(parents=True, exist_ok=True)
-
-    # ── Count already downloaded ───────────────────────────────────────────
-    if resume:
-        remaining = []
-        for tid in track_ids:
-            p = fma_path(fma_root, tid)
-            if not (p.exists() and p.stat().st_size > 10_000):
-                remaining.append(tid)
-        print(f"Resuming: {len(track_ids) - len(remaining):,} already done, "
-              f"{len(remaining):,} remaining")
-        track_ids = remaining
-    else:
-        print(f"Downloading {len(track_ids):,} tracks with {connections} connections")
-
-    if not track_ids:
-        print("All tracks already downloaded.")
-        return
-
-    # ── Progress tracking ──────────────────────────────────────────────────
-    success_count = 0
-    fail_count    = 0
-    bytes_saved   = 0
-
-    pbar = tqdm(total=len(track_ids), unit="track")
-
-    with ThreadPoolExecutor(max_workers=connections) as ex:
-        futures = {
-            ex.submit(download_track, tid, fma_path(fma_root, tid)): tid
-            for tid in track_ids
-        }
-        for fut in as_completed(futures):
-            tid    = futures[fut]
-            ok     = fut.result()
-            p      = fma_path(fma_root, tid)
-            if ok and p.exists():
-                success_count += 1
-                bytes_saved   += p.stat().st_size
-            else:
-                fail_count += 1
-
-            pbar.update(1)
-            pbar.set_postfix({
-                "ok": f"{success_count}",
-                "fail": f"{fail_count}",
-                "GB": f"{bytes_saved/1e9:.1f}",
-            })
-
-    pbar.close()
-
-    print(f"\nDownload complete:")
-    print(f"  Success:  {success_count:,} tracks  ({bytes_saved/1e9:.1f} GB)")
-    print(f"  Failed:   {fail_count:,} tracks (not found / network error)")
-    print(f"  Location: {fma_root}")
-
-    if fail_count > 0:
-        print(f"\nNote: {fail_count} tracks failed.")
-        print("  Some FMA tracks were deleted by their creators — this is expected.")
-        print("  Rerun with --resume to retry transient network failures.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser(
-        description="FMA selective download pipeline",
+        description="FMA selective download via HuggingFace streaming",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    sub = ap.add_subparsers(dest="stage", required=True)
-
-    # ── metadata ──────────────────────────────────────────────────────────
-    mp = sub.add_parser("metadata", help="Stage 1: download + extract fma_metadata.zip")
-    mp.add_argument("--fma-dir", required=True,
-                    help="FMA base directory (e.g. …/fma)")
-
-    # ── curate ────────────────────────────────────────────────────────────
-    cp = sub.add_parser("curate",
-                        help="Stage 2: curate track list from metadata")
-    cp.add_argument("--fma-dir",       required=True)
-    cp.add_argument("--track-list",    required=True,
-                    help="Output CSV of selected track IDs")
-    cp.add_argument("--seed",          type=int, default=42)
-
-    # ── audio ─────────────────────────────────────────────────────────────
-    ap2 = sub.add_parser("audio", help="Stage 3: parallel MP3 download")
-    ap2.add_argument("--fma-dir",    required=True)
-    ap2.add_argument("--track-list", required=True,
-                     help="CSV from the 'curate' stage")
-    ap2.add_argument("--connections", type=int, default=32,
-                     help="Parallel download threads")
-    ap2.add_argument("--resume",      action="store_true",
-                     help="Skip already-downloaded tracks")
-
-    # ── all (run all three stages) ────────────────────────────────────────
-    allp = sub.add_parser("all", help="Run all 3 stages end-to-end")
-    allp.add_argument("--fma-dir",    required=True)
-    allp.add_argument("--track-list", required=True)
-    allp.add_argument("--connections", type=int, default=32)
-    allp.add_argument("--seed",        type=int, default=42)
-    allp.add_argument("--resume",      action="store_true")
-
+    ap.add_argument(
+        "--output-dir", required=True,
+        help="FMA base directory — audio goes into <output-dir>/fma_full/",
+    )
+    ap.add_argument(
+        "--manifest", required=True,
+        help="Output manifest CSV (path, duration_s, genre_top, track_id)",
+    )
+    ap.add_argument(
+        "--resume", action="store_true",
+        help="Skip tracks already present in the manifest",
+    )
+    ap.add_argument(
+        "--target-h", type=float, default=TARGET_H,
+        help="Stop after this many hours of audio are saved",
+    )
     args = ap.parse_args()
-    fma_dir = Path(args.fma_dir)
 
-    if args.stage == "metadata":
-        stage_metadata(fma_dir)
-
-    elif args.stage == "curate":
-        stage_metadata(fma_dir)   # ensure metadata exists
-        stage_curate(fma_dir, Path(args.track_list), seed=args.seed)
-
-    elif args.stage == "audio":
-        stage_audio(fma_dir, Path(args.track_list),
-                    args.connections, args.resume)
-
-    elif args.stage == "all":
-        stage_metadata(fma_dir)
-        stage_curate(fma_dir, Path(args.track_list), seed=args.seed)
-        stage_audio(fma_dir, Path(args.track_list),
-                    args.connections, args.resume)
+    download_fma(
+        output_dir    = Path(args.output_dir),
+        manifest_path = Path(args.manifest),
+        resume        = args.resume,
+        target_h      = args.target_h,
+    )
 
 
 if __name__ == "__main__":

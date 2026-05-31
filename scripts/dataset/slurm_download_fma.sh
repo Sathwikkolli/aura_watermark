@@ -1,10 +1,11 @@
 #!/bin/bash
 # =============================================================================
-# SLURM Job: FMA selective download — metadata → curate → per-track MP3s
+# SLURM Job: FMA selective download via HuggingFace streaming
 #
-# This is a NETWORK I/O job — no GPU needed.
-# See partition guide in slurm_download_emilia.sh for details.
-# Default: gpu partition + 1 GPU (works universally on Great Lakes).
+# Source: benjamin-paine/free-music-archive-full (ungated, no login needed)
+# Downloads only 2,500 h of filtered audio — no 879 GB zip required.
+#
+# This is a NETWORK I/O job — GPU sits idle but required for SPANK plugin.
 # =============================================================================
 #SBATCH --job-name=fma_dl
 #SBATCH --partition=gpu
@@ -15,7 +16,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=14-00:00:00
 #SBATCH --output=logs/fma_dl_%j.log
-#SBATCH --account=hafiz_root
+#SBATCH --account=hafiz1
 
 set -euo pipefail
 
@@ -24,29 +25,30 @@ REPO="${SLURM_SUBMIT_DIR}"
 SCRIPTS="$REPO/scripts/dataset"
 FMA_DIR="$STORE/fma"
 MANIFEST_DIR="$FMA_DIR/manifests"
-TRACK_LIST="$MANIFEST_DIR/fma_selected_ids.csv"
+PYTHON=/home/ksathwik/.conda/envs/aura/bin/python
 
 mkdir -p "$FMA_DIR/fma_full" "$MANIFEST_DIR" "$REPO/logs"
 
-conda activate aura
-
 echo "[$(date '+%F %T')] Node: $(hostname)"
+echo "[$(date '+%F %T')] Python: $($PYTHON --version)"
+echo "[$(date '+%F %T')] Output: $FMA_DIR/fma_full"
+echo "[$(date '+%F %T')] Manifest: $MANIFEST_DIR/fma_raw.csv"
 
-# ── Stage 1+2: metadata download + curation (idempotent) ─────────────────────
-python "$SCRIPTS/download_fma.py" curate \
-    --fma-dir     "$FMA_DIR" \
-    --track-list  "$TRACK_LIST" \
-    --seed        42
+# ── Auto-detect resume ────────────────────────────────────────────────────────
+RESUME_FLAG=""
+if [ -f "$MANIFEST_DIR/fma_raw.csv" ]; then
+    N=$(wc -l < "$MANIFEST_DIR/fma_raw.csv")
+    echo "[$(date '+%F %T')] Existing manifest found ($N lines) — resuming"
+    RESUME_FLAG="--resume"
+fi
 
-echo "[$(date '+%F %T')] Track list ready — starting audio download"
-
-# ── Stage 3: parallel MP3 download (32 threads) ────────────────────────────
-python "$SCRIPTS/download_fma.py" audio \
-    --fma-dir      "$FMA_DIR" \
-    --track-list   "$TRACK_LIST" \
-    --connections  32 \
-    --resume
+# ── Stream + filter + download ────────────────────────────────────────────────
+$PYTHON "$SCRIPTS/download_fma.py" \
+    --output-dir "$FMA_DIR" \
+    --manifest   "$MANIFEST_DIR/fma_raw.csv" \
+    --target-h   2500 \
+    $RESUME_FLAG
 
 echo "[$(date '+%F %T')] FMA download complete"
-find "$FMA_DIR/fma_full" -name "*.mp3" | wc -l
+find "$FMA_DIR/fma_full" -name "*.mp3" -o -name "*.wav" | wc -l
 du -sh "$FMA_DIR/fma_full"
