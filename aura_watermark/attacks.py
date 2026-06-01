@@ -521,13 +521,15 @@ class AttackLayer(nn.Module):
         Moving-average filter with random window size in [smooth_min, smooth_max].
         Implemented as depthwise 1D conv with a uniform kernel.
         Fully differentiable.
+        Note: conv1d kernel is float32 — cast input from AMP float16 if needed.
         """
-        B, C, T = x.shape
-        win = random.randint(self.cfg.smooth_min_window, self.cfg.smooth_max_window)
-        kernel  = torch.ones(C, 1, win, device=x.device) / win
+        B, C, T    = x.shape
+        orig_dtype = x.dtype
+        win     = random.randint(self.cfg.smooth_min_window, self.cfg.smooth_max_window)
+        kernel  = torch.ones(C, 1, win, device=x.device, dtype=torch.float32) / win
         padding = win // 2
-        y = F.conv1d(x, kernel, padding=padding, groups=C)
-        return _pad_or_crop(y, T)
+        y = F.conv1d(x.float(), kernel, padding=padding, groups=C)
+        return _pad_or_crop(y, T).to(orig_dtype)
 
     def _speed(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -668,19 +670,21 @@ class AttackLayer(nn.Module):
         but the signal content is modified as intended.
 
         Fully differentiable.
+        Note: cuFFT in float16 requires power-of-2 signal length (96000 is not).
+              Cast to float32 before FFT to avoid this limitation.
         """
-        # Sample a non-trivial phase (exclude near-0 and near-2pi)
+        orig_dtype = x.dtype
+        x_f = x.float()                                       # ensure float32 for FFT
+
         phase = random.uniform(0.1, 2.0 * math.pi - 0.1)
-        X     = torch.fft.rfft(x, dim=-1)                            # complex64
-        # Multiply by exp(i*phase) = cos + i*sin
+        X     = torch.fft.rfft(x_f, dim=-1)                  # complex64
         c = math.cos(phase)
         s = math.sin(phase)
-        # Real part: Re(X)*c - Im(X)*s
-        # Imag part: Re(X)*s + Im(X)*c
         X_r = X.real * c - X.imag * s
         X_i = X.real * s + X.imag * c
         X_shifted = torch.complex(X_r, X_i)
-        return torch.fft.irfft(X_shifted, n=x.shape[-1], dim=-1)
+        y = torch.fft.irfft(X_shifted, n=x.shape[-1], dim=-1)
+        return y.to(orig_dtype)
 
     def _spaug(self, x: torch.Tensor) -> torch.Tensor:
         """
