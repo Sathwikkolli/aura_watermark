@@ -118,7 +118,7 @@ Stage 2 (steps 70k–200k): all five terms active — audio quality optimised.
 
 ---
 
-## Attacks (20 total)
+## Attacks (21 total)
 
 | # | Name | Description |
 |---|------|-------------|
@@ -142,6 +142,7 @@ Stage 2 (steps 70k–200k): all five terms active — audio quality optimised.
 | 18 | `quantize` | Uniform quantisation (4–16 bits) |
 | 19 | `phase_shift` | Global STFT phase rotation (energy preserved) |
 | 20 | `spaug` | SpecAugment: time + frequency masking |
+| 21 | `reverb` | Convolutional reverberation with synthetic RIR (100–500 ms, variable decay) |
 
 ---
 

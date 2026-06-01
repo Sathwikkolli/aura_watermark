@@ -162,8 +162,8 @@ class TrainingConfig:
 @dataclass
 class AttackConfig:
     """
-    Hyperparameters for the 20 signal-domain attacks.
-    Double-encoding (the 21st attack from the paper) is configured via
+    Hyperparameters for the 21 signal-domain attacks.
+    Double-encoding (the 22nd attack from the paper) is configured via
     TrainingConfig.de_* fields and handled inside the training loop.
 
     All attack parameter ranges are derived from the paper (Section 2.3)
@@ -230,6 +230,13 @@ class AttackConfig:
     spaug_max_freq_mask:  int = 50      # max consecutive freq bins
     spaug_num_time_masks: int = 2
     spaug_num_freq_masks: int = 2
+
+    # ── Reverb ────────────────────────────────────────────────────────────────
+    # Synthetic RIR: exponentially-decaying white noise  [paper: "given RIR"]
+    reverb_min_dur_ms: float = 100.0   # shortest RIR duration (ms)
+    reverb_max_dur_ms: float = 500.0   # longest  RIR duration (ms)
+    reverb_min_decay:  float = 4.0     # fastest decay (dry room)
+    reverb_max_decay:  float = 10.0    # slowest decay (wet room)
 
 
 @dataclass

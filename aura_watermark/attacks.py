@@ -1,7 +1,7 @@
 """
-Attack Layer — 20 signal-domain attacks for AURA robustness training.
+Attack Layer — 21 signal-domain attacks for AURA robustness training.
 
-Confirmed from paper Section 2.3.  Double-encoding (attack #21) is a
+Confirmed from paper Section 2.3.  Double-encoding (attack #22) is a
 training-loop concern (needs the embedder) and lives in the training loop.
 
 Gradient strategy
@@ -103,6 +103,7 @@ ATTACK_NAMES: List[str] = [
     "quantize",     # Bit-depth reduction to 4–16 bits (STE)
     "phase_shift",  # Global phase rotation via FFT
     "spaug",        # SpecAugment: random time + freq masking on STFT magnitude
+    "reverb",       # Convolutional reverberation with synthetic RIR [paper: RV]
 ]
 
 N_ATTACKS: int = len(ATTACK_NAMES)
@@ -346,6 +347,8 @@ class AttackLayer(nn.Module):
             return self._phase_shift(x)
         elif name == "spaug":
             return self._spaug(x)
+        elif name == "reverb":
+            return self._reverb(x)
         else:
             raise ValueError(f"Unknown attack: {name!r}")
 
@@ -422,11 +425,16 @@ class AttackLayer(nn.Module):
         return _ste(x, attacked)
 
     def _aac(self, x: torch.Tensor) -> torch.Tensor:
-        """AAC codec via OGG container (torchaudio). STE."""
+        """
+        AAC-like codec attack. STE.
+
+        True AAC requires ffmpeg. We attempt OGG/Vorbis first (perceptually
+        closer to AAC than MP3 — both use psychoacoustic masking with MDCT),
+        then fall back to MP3 if unavailable. _codec_encode_decode handles
+        the fallback chain internally.
+        """
         bitrate = random.choice(self.cfg.aac_bitrates)
-        # torchaudio uses "ogg" format with opus/vorbis encoding as proxy for AAC-like lossy coding
-        # True AAC requires ffmpeg; try mp3 as fallback for similar perceptual quality
-        attacked = _codec_encode_decode(x, self.sr, fmt="mp3", bitrate_kbps=bitrate)
+        attacked = _codec_encode_decode(x, self.sr, fmt="ogg", bitrate_kbps=bitrate)
         return _ste(x, attacked)
 
     def _opus(self, x: torch.Tensor) -> torch.Tensor:
@@ -698,6 +706,62 @@ class AttackLayer(nn.Module):
             window=window, length=T, center=True,
         )
         return y.view(B, C, T)
+
+
+    def _reverb(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Convolutional reverberation with a synthetic Room Impulse Response (RIR).
+
+        Paper Section 2.3: "Reverb(RV): convolutional reverberation with a given RIR"
+
+        Method:
+          Generates a synthetic RIR by multiplying unit-variance white noise with
+          an exponential decay envelope, simulating a small-to-medium sized room.
+          The RIR is then convolved with the audio via FFT for efficiency.
+
+          Parameters sampled per call:
+            rir_dur  ~ Uniform[reverb_min_dur_ms, reverb_max_dur_ms]  (RIR length)
+            decay    ~ Uniform[reverb_min_decay,  reverb_max_decay]   (room damping)
+
+          Low decay  (4.0)  → short RT60 → dry room (office, corridor)
+          High decay (10.0) → long  RT60 → wet room (church, hall)
+
+        Fully differentiable (gradient flows through FFT convolution).
+        """
+        cfg = self.cfg
+        B, C, T = x.shape
+        device  = x.device
+        dtype   = x.dtype
+
+        # ── Synthetic RIR ────────────────────────────────────────────────────
+        dur_ms  = random.uniform(cfg.reverb_min_dur_ms, cfg.reverb_max_dur_ms)
+        decay   = random.uniform(cfg.reverb_min_decay,  cfg.reverb_max_decay)
+        rir_len = max(1, int(dur_ms / 1000.0 * self.sr))
+
+        # Exponentially-decaying white noise
+        t   = torch.arange(rir_len, device=device, dtype=dtype)
+        rir = torch.randn(rir_len, device=device, dtype=dtype)
+        rir = rir * torch.exp(-decay * t / self.sr)
+
+        # Normalise so peak = 1 (preserves signal loudness after convolution)
+        rir = rir / (rir.abs().max().clamp(min=1e-8))
+
+        # ── FFT convolution ──────────────────────────────────────────────────
+        # Next power of 2 ≥ T + rir_len − 1 for linear (non-circular) convolution
+        n_fft = 1
+        while n_fft < T + rir_len - 1:
+            n_fft <<= 1
+
+        # [B, C, T] → [B, C, n_fft//2+1] complex
+        X = torch.fft.rfft(x,   n=n_fft, dim=-1)
+        # [rir_len] → [1, 1, n_fft//2+1] complex (broadcast over B, C)
+        R = torch.fft.rfft(rir, n=n_fft, dim=-1).unsqueeze(0).unsqueeze(0)
+
+        y = torch.fft.irfft(X * R, n=n_fft, dim=-1)[..., :T]
+
+        # Clip to [-1, 1] to avoid trainer instability from occasional
+        # large values when decay is slow and RIR is long
+        return y.clamp(-1.0, 1.0)
 
 
 # ── Adaptive Curriculum ───────────────────────────────────────────────────────
