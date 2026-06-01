@@ -392,31 +392,34 @@ class AttackLayer(nn.Module):
         Biquad low-pass filter with random cutoff in [lp_min_cutoff_hz, lp_max_cutoff_hz].
         Uses torchaudio.functional.lowpass_biquad — fully differentiable.
         Falls back to identity if torchaudio unavailable.
+        Note: biquad requires float32/float64 — cast from AMP float16 if needed.
         """
         if not _TORCHAUDIO_AVAILABLE:
             return x
         cutoff = random.uniform(self.cfg.lp_min_cutoff_hz, self.cfg.lp_max_cutoff_hz)
-        B, C, T = x.shape
-        # lowpass_biquad expects [C, T]
-        x_2d = x.view(B * C, T)
+        B, C, T   = x.shape
+        orig_dtype = x.dtype
+        x_2d = x.view(B * C, T).float()        # biquad requires float32
         y = TAF.lowpass_biquad(x_2d, self.sr, cutoff_freq=cutoff)
-        return y.view(B, C, T)
+        return y.to(orig_dtype).view(B, C, T)
 
     def _bandpass(self, x: torch.Tensor) -> torch.Tensor:
         """
         Band-pass by chaining highpass(low_cutoff) + lowpass(high_cutoff).
         Cutoffs sampled from paper-specified ranges.
         Fully differentiable.
+        Note: biquad requires float32/float64 — cast from AMP float16 if needed.
         """
         if not _TORCHAUDIO_AVAILABLE:
             return x
         low  = random.uniform(self.cfg.bp_low_min_hz,  self.cfg.bp_low_max_hz)
         high = random.uniform(self.cfg.bp_high_min_hz, self.cfg.bp_high_max_hz)
-        B, C, T = x.shape
-        x_2d = x.view(B * C, T)
+        B, C, T    = x.shape
+        orig_dtype = x.dtype
+        x_2d = x.view(B * C, T).float()        # biquad requires float32
         y = TAF.highpass_biquad(x_2d, self.sr, cutoff_freq=low)
-        y = TAF.lowpass_biquad(y, self.sr, cutoff_freq=high)
-        return y.view(B, C, T)
+        y = TAF.lowpass_biquad(y,     self.sr, cutoff_freq=high)
+        return y.to(orig_dtype).view(B, C, T)
 
     def _mp3(self, x: torch.Tensor) -> torch.Tensor:
         """MP3 codec. STE: output is codec output, gradient is identity."""
@@ -451,11 +454,12 @@ class AttackLayer(nn.Module):
         """
         if not _TORCHAUDIO_AVAILABLE:
             return x
-        target_sr = random.choice(self.cfg.resample_rates)
+        target_sr  = random.choice(self.cfg.resample_rates)
+        orig_dtype = x.dtype
         T = x.shape[-1]
-        y = TAF.resample(x, orig_freq=self.sr, new_freq=target_sr)
-        y = TAF.resample(y, orig_freq=target_sr, new_freq=self.sr)
-        return _pad_or_crop(y, T)
+        y = TAF.resample(x.float(), orig_freq=self.sr, new_freq=target_sr)
+        y = TAF.resample(y,         orig_freq=target_sr, new_freq=self.sr)
+        return _pad_or_crop(y, T).to(orig_dtype)
 
     def _suppress(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -559,11 +563,11 @@ class AttackLayer(nn.Module):
         """
         if not _TORCHAUDIO_AVAILABLE:
             return x
-        num, den = random.choice(_PITCH_RATIOS)   # ratio num/den  (coprime, small)
-        T        = x.shape[-1]
-        # Resample: new pitch = num/den × original pitch; length changes
-        y = TAF.resample(x, orig_freq=den, new_freq=num)
-        return _pad_or_crop(y, T)                 # restore to T samples
+        num, den   = random.choice(_PITCH_RATIOS)
+        orig_dtype = x.dtype
+        T          = x.shape[-1]
+        y = TAF.resample(x.float(), orig_freq=den, new_freq=num)
+        return _pad_or_crop(y, T).to(orig_dtype)
 
     def _speed_pitch(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -573,10 +577,11 @@ class AttackLayer(nn.Module):
         """
         if not _TORCHAUDIO_AVAILABLE:
             return x
-        num, den = random.choice(_SPEED_PITCH_RATIOS)
-        T        = x.shape[-1]
-        y = TAF.resample(x, orig_freq=den, new_freq=num)
-        return _pad_or_crop(y, T)
+        num, den   = random.choice(_SPEED_PITCH_RATIOS)
+        orig_dtype = x.dtype
+        T          = x.shape[-1]
+        y = TAF.resample(x.float(), orig_freq=den, new_freq=num)
+        return _pad_or_crop(y, T).to(orig_dtype)
 
     def _amplitude(self, x: torch.Tensor) -> torch.Tensor:
         """
