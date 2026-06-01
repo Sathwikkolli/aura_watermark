@@ -118,13 +118,14 @@ Stage 2 (steps 70k–200k): all five terms active — audio quality optimised.
 
 ---
 
-## Attacks (21 total)
+## Attacks (22 total)
 
 | # | Name | Description |
 |---|------|-------------|
 | 1 | `noise` | Additive white Gaussian noise (SNR 10–40 dB) |
 | 2 | `pink_noise` | Pink (1/f) noise via STFT phase randomisation |
 | 3 | `lowpass` | Biquad lowpass (3–6 kHz cutoff) |
+| 4 | `highpass` | Biquad highpass (300 Hz–3 kHz cutoff) — Table 1: HP |
 | 4 | `bandpass` | Biquad bandpass (300–400 Hz ↔ 7–9 kHz) |
 | 5 | `mp3` | MP3 codec at 64/96/128/192 kbps (STE gradient) |
 | 6 | `aac` | AAC codec at 32/64/96/128 kbps (STE gradient) |

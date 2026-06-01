@@ -162,9 +162,9 @@ class TrainingConfig:
 @dataclass
 class AttackConfig:
     """
-    Hyperparameters for the 21 signal-domain attacks.
-    Double-encoding (the 22nd attack from the paper) is configured via
-    TrainingConfig.de_* fields and handled inside the training loop.
+    Hyperparameters for the 22 signal-domain attacks.
+    Double-encoding is configured via TrainingConfig.de_* fields
+    and handled inside the training loop.
 
     All attack parameter ranges are derived from the paper (Section 2.3)
     unless noted.  Adaptive curriculum parameters follow the paper formula:
@@ -187,6 +187,11 @@ class AttackConfig:
     # ── Low-pass filter ───────────────────────────────────────────────────────
     lp_min_cutoff_hz: float = 3_000.0   # [paper: 3kHz–6kHz]
     lp_max_cutoff_hz: float = 6_000.0
+
+    # ── High-pass filter ──────────────────────────────────────────────────────
+    # Paper Table 1: HP attack. Removes low-frequency content.
+    hp_min_cutoff_hz: float = 300.0     # gentle rumble filter
+    hp_max_cutoff_hz: float = 3_000.0   # aggressive thinning
 
     # ── Band-pass filter ──────────────────────────────────────────────────────
     bp_low_min_hz:  float = 300.0       # [paper: 300–400 Hz]

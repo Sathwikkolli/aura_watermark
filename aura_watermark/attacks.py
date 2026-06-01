@@ -1,8 +1,8 @@
 """
-Attack Layer — 21 signal-domain attacks for AURA robustness training.
+Attack Layer — 22 signal-domain attacks for AURA robustness training.
 
-Confirmed from paper Section 2.3.  Double-encoding (attack #22) is a
-training-loop concern (needs the embedder) and lives in the training loop.
+Confirmed from paper Section 2.3 and Table 1.  Double-encoding is a
+training-loop technique handled separately in the training loop.
 
 Gradient strategy
 ─────────────────
@@ -85,8 +85,9 @@ _PITCH_RATIOS: List[Tuple[int, int]] = [
 ATTACK_NAMES: List[str] = [
     "noise",        # White noise at a random SNR
     "pink_noise",   # Pink (1/f) noise scaled to signal RMS
-    "lowpass",      # Biquad LP filter, cutoff 3–6 kHz
-    "bandpass",     # Biquad HP+LP chain, 300–400 Hz → 7–9 kHz passband
+    "lowpass",      # Biquad LP filter, cutoff 3–6 kHz          [paper: LP]
+    "highpass",     # Biquad HP filter, cutoff 300–3000 Hz      [paper: HP — Table 1]
+    "bandpass",     # Biquad HP+LP chain, 300–400 Hz → 7–9 kHz [paper: BF]
     "mp3",          # MP3 encode/decode (STE)
     "aac",          # AAC encode/decode (STE)
     "opus",         # Opus encode/decode (STE)
@@ -313,6 +314,8 @@ class AttackLayer(nn.Module):
             return self._pink_noise(x)
         elif name == "lowpass":
             return self._lowpass(x)
+        elif name == "highpass":
+            return self._highpass(x)
         elif name == "bandpass":
             return self._bandpass(x)
         elif name == "mp3":
@@ -397,11 +400,31 @@ class AttackLayer(nn.Module):
         if not _TORCHAUDIO_AVAILABLE:
             return x
         cutoff = random.uniform(self.cfg.lp_min_cutoff_hz, self.cfg.lp_max_cutoff_hz)
-        B, C, T   = x.shape
-        orig_dtype = x.dtype
-        x_2d = x.view(B * C, T).float()        # biquad requires float32
+        B, C, T     = x.shape
+        orig_dtype  = x.dtype
+        orig_device = x.device
+        # biquad requires float32 on CPU (no CUDA support in this torchaudio version)
+        x_2d = x.view(B * C, T).float().cpu()
         y = TAF.lowpass_biquad(x_2d, self.sr, cutoff_freq=cutoff)
-        return y.to(orig_dtype).view(B, C, T)
+        return y.to(device=orig_device, dtype=orig_dtype).view(B, C, T)
+
+    def _highpass(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Biquad high-pass filter with random cutoff.
+        Paper Table 1: HP attack in the Filtering category.
+        Cutoff sampled from [hp_min_cutoff_hz, hp_max_cutoff_hz].
+        Simulates removal of low-frequency content (rumble, hum).
+        Note: biquad requires float32 on CPU (no CUDA support in this torchaudio version).
+        """
+        if not _TORCHAUDIO_AVAILABLE:
+            return x
+        cutoff      = random.uniform(self.cfg.hp_min_cutoff_hz, self.cfg.hp_max_cutoff_hz)
+        B, C, T     = x.shape
+        orig_dtype  = x.dtype
+        orig_device = x.device
+        x_2d = x.view(B * C, T).float().cpu()
+        y = TAF.highpass_biquad(x_2d, self.sr, cutoff_freq=cutoff)
+        return y.to(device=orig_device, dtype=orig_dtype).view(B, C, T)
 
     def _bandpass(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -414,12 +437,14 @@ class AttackLayer(nn.Module):
             return x
         low  = random.uniform(self.cfg.bp_low_min_hz,  self.cfg.bp_low_max_hz)
         high = random.uniform(self.cfg.bp_high_min_hz, self.cfg.bp_high_max_hz)
-        B, C, T    = x.shape
-        orig_dtype = x.dtype
-        x_2d = x.view(B * C, T).float()        # biquad requires float32
+        B, C, T     = x.shape
+        orig_dtype  = x.dtype
+        orig_device = x.device
+        # biquad requires float32 on CPU (no CUDA support in this torchaudio version)
+        x_2d = x.view(B * C, T).float().cpu()
         y = TAF.highpass_biquad(x_2d, self.sr, cutoff_freq=low)
         y = TAF.lowpass_biquad(y,     self.sr, cutoff_freq=high)
-        return y.to(orig_dtype).view(B, C, T)
+        return y.to(device=orig_device, dtype=orig_dtype).view(B, C, T)
 
     def _mp3(self, x: torch.Tensor) -> torch.Tensor:
         """MP3 codec. STE: output is codec output, gradient is identity."""
