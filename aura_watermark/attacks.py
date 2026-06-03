@@ -856,6 +856,9 @@ class AdaptiveCurriculum:
         """
         if attack_name not in self._buffers:
             raise ValueError(f"Unknown attack: {attack_name!r}")
+        # Discard NaN/Inf losses (e.g. from corrupt audio files)
+        if not math.isfinite(loss_value):
+            return
         self._buffers[attack_name].append(float(loss_value))
         self._recompute()
 
@@ -897,14 +900,19 @@ class AdaptiveCurriculum:
     def _recompute(self) -> None:
         """Recompute probabilities from current rolling averages."""
         # Rolling average per attack (default 1.0 if no data yet)
+        # Guard against NaN/Inf from corrupt audio or numerical instability
         l_bar: Dict[str, float] = {}
         for name in self.attack_names:
             buf = self._buffers[name]
-            l_bar[name] = (sum(buf) / len(buf)) if buf else 1.0
+            if buf:
+                mean = sum(buf) / len(buf)
+                l_bar[name] = mean if math.isfinite(mean) else 1.0
+            else:
+                l_bar[name] = 1.0
 
         total = sum(l_bar.values())
-        if total < 1e-8:
-            total = 1e-8
+        if not math.isfinite(total) or total < 1e-8:
+            total = max(total, 1e-8)
 
         # Apply P_min floor
         raw = {
@@ -914,6 +922,12 @@ class AdaptiveCurriculum:
 
         # Renormalise to sum=1
         total_raw = sum(raw.values())
+        if not math.isfinite(total_raw) or total_raw < 1e-8:
+            # Fallback to uniform if something is still wrong
+            uniform = 1.0 / len(self.attack_names)
+            self._probs = {name: uniform for name in self.attack_names}
+            return
+
         self._probs = {
             name: raw[name] / total_raw
             for name in self.attack_names

@@ -243,8 +243,10 @@ class AudioSegmentDataset(Dataset):
             try:
                 waveform = load_audio(self.paths[idx], self.target_sr)
                 if waveform is None or waveform.shape[-1] < self.target_sr // 4:
-                    # Skip very short or unloadable clips
                     raise ValueError("clip too short or load failed")
+                # Reject corrupt files (e.g. bad FMA MP3s with illegal headers)
+                if torch.isnan(waveform).any() or torch.isinf(waveform).any():
+                    raise ValueError("NaN/Inf in audio — corrupt file")
 
                 waveform = random_segment(waveform, self.n_samples)
                 waveform = peak_normalize(waveform)

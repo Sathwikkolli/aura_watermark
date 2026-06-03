@@ -49,7 +49,7 @@ class ConformerConfig:
     # --- memory ---
     # Recompute Conformer activations during backward instead of storing them.
     # Saves ~60% VRAM on V100 16 GB at the cost of ~30% extra compute.
-    use_gradient_checkpointing: bool = True
+    use_gradient_checkpointing: bool = False  # A40 has 48GB VRAM — no need to checkpoint
 
 
 @dataclass
