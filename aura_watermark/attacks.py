@@ -48,6 +48,14 @@ try:
 except ImportError:
     _TORCHAUDIO_AVAILABLE = False
 
+# apply_codec is deprecated but still the fastest in-memory codec path; the
+# warning fires once per call and floods training logs.  Silence it once here.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*apply_codec has been deprecated.*",
+    category=UserWarning,
+)
+
 from .config import AttackConfig
 
 
@@ -196,7 +204,13 @@ def _codec_encode_decode(
     results = []
 
     for b in range(x_cpu.shape[0]):
-        wav = x_cpu[b]  # [1, T]
+        # Sanitize before handing audio to any C codec (LAME/FFmpeg).
+        # LAME's psychoacoustic model asserts spectral energy >= 0 and calls
+        # abort() (uncatchable SIGABRT, core dump) on NaN/Inf or out-of-range
+        # input.  Force finite, in-range float32 so the encoder never crashes.
+        wav = torch.nan_to_num(
+            x_cpu[b], nan=0.0, posinf=1.0, neginf=-1.0
+        ).clamp_(-1.0, 1.0).float()  # [1, T]
         success = False
 
         # Method 1: apply_codec
@@ -308,6 +322,11 @@ class AttackLayer(nn.Module):
         cfg = self.cfg
         sr  = self.sr
 
+        if name == "identity":
+            # No-op pass-through used by the trainer's cold-start warmup so the
+            # detector can lock onto the clean watermark before attacks ramp.
+            # Intentionally NOT in ATTACK_NAMES (excluded from curriculum/eval).
+            return x
         if name == "noise":
             return self._noise(x)
         elif name == "pink_noise":

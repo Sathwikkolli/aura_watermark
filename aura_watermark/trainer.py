@@ -234,8 +234,10 @@ class AURATrainer:
         self.disc_opt = Adam(discriminator.parameters(),     lr=tc.learning_rate)
 
         # ── AMP scalers (one per optimiser) ────────────────────────────────
-        # cpu tensors: scaler is a no-op (enabled=False)
-        amp_enabled   = device.type == "cuda"
+        # AMP (float16) is opt-in via cfg.training.use_amp and only on CUDA.
+        # Default fp32: the watermark is a small signal float16 corrupts, and
+        # float16 over/underflow is what fed NaN/Inf into the LAME codec.
+        amp_enabled   = tc.use_amp and device.type == "cuda"
         self.gen_scaler  = GradScaler(enabled=amp_enabled)
         self.disc_scaler = GradScaler(enabled=amp_enabled)
 
@@ -262,6 +264,27 @@ class AURATrainer:
     @property
     def current_p_de(self) -> float:
         return compute_double_encode_prob(self.global_step, self.cfg)
+
+    # ── Cold-start curriculum warmup ─────────────────────────────────────────
+
+    # Easy attacks for the second warmup phase: cheap, near-invertible ops the
+    # detector can learn robustness to once it can decode the clean watermark.
+    _EASY_WARMUP_ATTACKS = ("noise", "boost", "duck", "amplitude", "pink_noise")
+
+    def _warmup_attack_name(self) -> Optional[str]:
+        """
+        Select the attack for this step's cold-start warmup.
+
+            step < clean_steps                → "identity" (no attack)
+            clean_steps ≤ step < warmup_steps → random easy attack
+            step ≥ warmup_steps               → None (full adaptive curriculum)
+        """
+        tc = self.cfg.training
+        if self.global_step < tc.clean_steps:
+            return "identity"
+        if self.global_step < tc.curriculum_warmup_steps:
+            return random.choice(self._EASY_WARMUP_ATTACKS)
+        return None
 
     # ── LR update ─────────────────────────────────────────────────────────
 
@@ -292,7 +315,7 @@ class AURATrainer:
             attack_name:     str name of the attack applied
         """
         tc   = self.cfg.training
-        amp  = self.device.type == "cuda"
+        amp  = tc.use_amp and self.device.type == "cuda"
 
         with torch.autocast(device_type=self.device.type, enabled=amp):
 
@@ -313,8 +336,9 @@ class AURATrainer:
                 active_message = msg2
                 x_wm           = x_wm_de
 
-            # ── 3. Apply attack ────────────────────────────────────────────
-            x_attacked, attack_name = self.attack_layer(x_wm)   # [B, 1, T]
+            # ── 3. Apply attack (cold-start warmup → full curriculum) ──────
+            forced = self._warmup_attack_name()
+            x_attacked, attack_name = self.attack_layer(x_wm, attack_name=forced)
 
             # ── 4. Detect from attacked audio ──────────────────────────────
             mag_attacked, _ = self.embedder.stft(x_attacked)    # [B, 1025, 188]
@@ -419,8 +443,11 @@ class AURATrainer:
             self.disc_scaler.scale(scaled_disc_loss).backward()
 
         # ── Update curriculum ──────────────────────────────────────────────
-        bit_loss_for_curriculum = gen_comp.msg.item()
-        self.attack_layer.curriculum.record(attack_name, bit_loss_for_curriculum)
+        # Only record once the full adaptive curriculum is active, so warmup
+        # attacks (incl. the "identity" no-op) don't pollute adaptive stats.
+        if self.global_step >= self.cfg.training.curriculum_warmup_steps:
+            bit_loss_for_curriculum = gen_comp.msg.item()
+            self.attack_layer.curriculum.record(attack_name, bit_loss_for_curriculum)
 
         # ── Accumulation counter ───────────────────────────────────────────
         self._accum_count += 1

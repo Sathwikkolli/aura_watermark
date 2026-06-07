@@ -24,7 +24,9 @@ set -euo pipefail
 STORE=/nfs/turbo/umd-hafiz/issf_server_data
 REPO="${SLURM_SUBMIT_DIR}"
 PYTHON=/home/ksathwik/.conda/envs/aura/bin/python
-CKPT_DIR="$REPO/checkpoints/run_001"
+# Fresh restart with convergence + crash fixes (run_001 learned a degenerate
+# loud-but-unreadable code; kept for comparison). New runs land in run_002.
+CKPT_DIR="$REPO/checkpoints/run_002"
 
 mkdir -p "$REPO/logs" "$CKPT_DIR"
 

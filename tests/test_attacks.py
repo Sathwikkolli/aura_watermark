@@ -49,8 +49,8 @@ def make_audio(batch: int = B, peak: float = 0.9) -> torch.Tensor:
 # ── Attack registry ───────────────────────────────────────────────────────────
 
 def test_attack_count():
-    """Must have exactly 20 registered attacks."""
-    assert N_ATTACKS == 20, f"Expected 20 attacks, got {N_ATTACKS}"
+    """Must have exactly 22 registered attacks (paper Section 2.3)."""
+    assert N_ATTACKS == 22, f"Expected 22 attacks, got {N_ATTACKS}"
     print(f"  Registered attacks: {N_ATTACKS}  [PASS]")
     for i, name in enumerate(ATTACK_NAMES):
         print(f"    {i+1:02d}. {name}")
@@ -580,7 +580,7 @@ if __name__ == "__main__":
         test_echo_adds_delayed_signal,
         test_boost_and_duck_levels,
         test_quantize_reduces_precision,
-        test_phase_shift_preserves_magnitude,
+        test_phase_shift_preserves_energy,
         test_spaug_zeros_some_frequencies,
         # Helpers
         test_ste_helper,

@@ -133,6 +133,19 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     stage1_steps: int = 70_000
 
+    # --- precision ---
+    # Whole-graph AMP (float16) corrupts the small watermark signal and is the
+    # source of the NaN/Inf that crashed the LAME codec.  The paper assumes full
+    # precision; default to fp32.  113M params @ batch 32 fits A40 48 GB in fp32.
+    use_amp: bool = False
+
+    # --- cold-start curriculum warmup (paper-faithful bootstrap) ---
+    # The detector cannot decode at init, so all-22-attacks-from-step-0 with the
+    # adaptive curriculum up-weighting the hardest attacks deadlocks training.
+    # Warm up on clean, then easy attacks, before enabling the full curriculum.
+    clean_steps: int = 500                 # steps [0, clean_steps): identity (no attack)
+    curriculum_warmup_steps: int = 2_000   # steps [clean_steps, this): easy subset only
+
     # --- recommended (paper silent) ---
     warmup_steps: int = 5_000
     total_steps: int = 200_000

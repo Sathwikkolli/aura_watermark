@@ -347,6 +347,10 @@ def test_lr_applied_to_optimiser():
 def test_curriculum_updated_each_step():
     cfg = small_cfg()
     cfg.training.grad_accum_steps = 1
+    # Disable cold-start warmup so the adaptive curriculum is active immediately
+    # (warmup intentionally skips curriculum.record for its first steps).
+    cfg.training.clean_steps = 0
+    cfg.training.curriculum_warmup_steps = 0
     trainer = make_trainer(cfg)
 
     probs_before = trainer.attack_layer.curriculum.probabilities()
@@ -456,6 +460,35 @@ def test_no_nan_inf_in_losses():
 # Runner
 # ═════════════════════════════════════════════════════════════════════════════
 
+def test_coldstart_overfit_single_batch():
+    """
+    The embedder<-detector loop must actually learn: trained on a single fixed
+    batch under the clean (identity) attack, bit accuracy must climb well above
+    chance within a few hundred steps. This is the direct regression guard for
+    the cold-start deadlock (large distortion but BER ~= 0.44) we fixed.
+    """
+    cfg = small_cfg()
+    cfg.training.grad_accum_steps = 1
+    cfg.training.learning_rate    = 1e-3   # overfit fast on one batch
+    cfg.training.warmup_steps     = 1
+    cfg.training.stage1_steps     = 10_000 # stay in stage 1 (msg loss only)
+    cfg.training.clean_steps      = 10_000 # force identity attack throughout
+    trainer = make_trainer(cfg)
+
+    audio, message = make_batch()          # fixed batch + fixed message
+
+    final_acc = 0.0
+    for _ in range(250):
+        result = trainer.train_step(audio, message)
+        final_acc = result.bit_acc
+
+    assert final_acc > 0.95, (
+        f"Embedder/detector failed to overfit one batch: bit_acc={final_acc:.3f} "
+        f"(expected > 0.95). The encode/decode loop is not learning."
+    )
+    print(f"  Cold-start overfit: bit_acc={final_acc:.3f} after 250 steps  [PASS]")
+
+
 TESTS = [
     ("test_compute_lr_at_zero",              test_compute_lr_at_zero),
     ("test_compute_lr_warmup_linear",         test_compute_lr_warmup_linear),
@@ -482,6 +515,7 @@ TESTS = [
     ("test_checkpoint_step_preserved",        test_checkpoint_step_preserved),
     ("test_prune_checkpoints",                test_prune_checkpoints),
     ("test_no_nan_inf_in_losses",             test_no_nan_inf_in_losses),
+    ("test_coldstart_overfit_single_batch",   test_coldstart_overfit_single_batch),
 ]
 
 if __name__ == "__main__":

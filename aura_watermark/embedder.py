@@ -185,6 +185,14 @@ class StegaformerEmbedder(nn.Module):
         # Combine watermarked magnitude with original phase
         watermarked = self.istft(s_wm, phase)              # [B, 1, 96000]
 
+        # Guarantee finite audio leaves the embedder. The ISTFT already clamps
+        # to [-1, 1], but a non-finite magnitude (possible early in training)
+        # would propagate NaN/Inf into downstream attacks — notably the LAME
+        # MP3 codec, which aborts the process on non-finite input.
+        watermarked = torch.nan_to_num(
+            watermarked, nan=0.0, posinf=1.0, neginf=-1.0
+        )
+
         return watermarked, mask, s_mag
 
     # ── Convenience ───────────────────────────────────────────────────────
