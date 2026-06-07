@@ -384,9 +384,11 @@ class AttackLayer(nn.Module):
         """
         snr_db = random.uniform(self.cfg.noise_min_snr_db, self.cfg.noise_max_snr_db)
 
-        signal_rms = x.pow(2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
+        # Clamp INSIDE the sqrt: sqrt(0) has an infinite backward gradient, which
+        # NaN-poisons the embedder when a batch contains a silent segment.
+        signal_rms = x.pow(2).mean(dim=-1, keepdim=True).clamp(min=1e-12).sqrt()
         noise      = torch.randn_like(x)
-        noise_rms  = noise.pow(2).mean(dim=-1, keepdim=True).sqrt().clamp(min=1e-8)
+        noise_rms  = noise.pow(2).mean(dim=-1, keepdim=True).clamp(min=1e-12).sqrt()
 
         # Scale noise so SNR = 10 log10(signal_rms² / noise_rms²)
         target_noise_rms = signal_rms / (10.0 ** (snr_db / 20.0))

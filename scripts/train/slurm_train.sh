@@ -40,7 +40,9 @@ echo "[$(date '+%F %T')] Checkpoints: $CKPT_DIR"
 
 # ── Auto-detect latest checkpoint for resume ──────────────────────────────────
 RESUME_FLAG=""
-LATEST=$(ls -t "$CKPT_DIR"/step_*.pt 2>/dev/null | grep -v final | head -1)
+# `|| true` so an empty checkpoint dir (fresh run) doesn't trip `set -e pipefail`:
+# with no match, ls/grep exit non-zero and would otherwise abort the whole script.
+LATEST=$(ls -t "$CKPT_DIR"/step_*.pt 2>/dev/null | grep -v final | head -1 || true)
 if [ -n "$LATEST" ]; then
     echo "[$(date '+%F %T')] Resuming from: $LATEST"
     RESUME_FLAG="--resume $LATEST"

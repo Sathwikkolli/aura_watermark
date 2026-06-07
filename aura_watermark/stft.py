@@ -99,7 +99,13 @@ class STFTProcessor(nn.Module):
             return_complex=True,
         )   # [B, 1025, 188]
 
-        magnitude = torch.abs(stft_complex)    # always >= 0
+        # Stabilised magnitude: sqrt(re^2 + im^2 + eps) instead of torch.abs().
+        # torch.abs() on a complex tensor has an INFINITE gradient at bins whose
+        # magnitude is ~0 (d|z|/dz = z/|z| → 0/0). The detector backprops through
+        # a fresh STFT of the *attacked* audio, so a single near-zero bin yields
+        # an inf gradient that clip_grad_norm_ then smears across all params,
+        # permanently NaN-poisoning the weights. The eps floor keeps it finite.
+        magnitude = (stft_complex.real.pow(2) + stft_complex.imag.pow(2) + 1e-10).sqrt()
         phase = torch.angle(stft_complex)      # in [-pi, pi]
 
         return magnitude, phase

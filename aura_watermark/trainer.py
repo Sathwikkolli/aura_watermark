@@ -456,22 +456,28 @@ class AURATrainer:
         if did_step:
             # ── Generator optimiser step ───────────────────────────────────
             self.gen_scaler.unscale_(self.gen_opt)
-            nn.utils.clip_grad_norm_(
+            gen_norm = nn.utils.clip_grad_norm_(
                 [p for pg in self.gen_opt.param_groups for p in pg["params"]],
                 self.cfg.training.max_grad_norm,
             )
-            self.gen_scaler.step(self.gen_opt)
+            # Skip the update when gradients are non-finite (NaN/Inf) so a single
+            # bad batch (e.g. a pathological attack/STFT corner) cannot permanently
+            # poison the weights and Adam state. In AMP this is GradScaler's job;
+            # in fp32 (use_amp=False) we must do it explicitly.
+            if torch.isfinite(gen_norm):
+                self.gen_scaler.step(self.gen_opt)
             self.gen_scaler.update()
             self.gen_opt.zero_grad(set_to_none=True)
 
             # ── Discriminator optimiser step (stage 2 only) ────────────────
             if stage == 2 and scaled_disc_loss is not None:
                 self.disc_scaler.unscale_(self.disc_opt)
-                nn.utils.clip_grad_norm_(
+                disc_norm = nn.utils.clip_grad_norm_(
                     self.discriminator.parameters(),
                     self.cfg.training.max_grad_norm,
                 )
-                self.disc_scaler.step(self.disc_opt)
+                if torch.isfinite(disc_norm):
+                    self.disc_scaler.step(self.disc_opt)
                 self.disc_scaler.update()
                 self.disc_opt.zero_grad(set_to_none=True)
 
