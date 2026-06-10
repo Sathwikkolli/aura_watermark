@@ -51,6 +51,9 @@ else
 fi
 
 # ── Train ─────────────────────────────────────────────────────────────────────
+# Reduce CUDA allocator fragmentation (helps the Stage-2 discriminator fit).
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 $PYTHON "$REPO/train.py" \
     --emilia-root    "$STORE/emilia" \
     --fma-root       "$STORE/fma" \
