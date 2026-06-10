@@ -154,12 +154,12 @@ class TrainingConfig:
     lr_min: float = 1e-6            # cosine annealing floor
 
     # Batch / accumulation (A40 48 GB settings)
-    # With AMP on (use_amp=True), float16 activations roughly halve memory, so
-    # batch 16 fits with headroom (≈ fp32 batch 8) while halving the micro-steps
-    # vs batch 8 → faster. If running fp32 (use_amp=False), drop to batch 8 to
-    # avoid the Stage-2 discriminator OOM. Effective batch is 64 either way.
-    batch_size: int = 16            # local batch per step
-    grad_accum_steps: int = 4       # virtual batch = 64
+    # batch 8 for Stage 2: the BigVGAN MS-STFT discriminator (called 3-4x/step
+    # with retained feature maps for the FM loss) is so memory-heavy that even
+    # AMP batch 16 OOMs by a hair. batch 8 fits with large margin under AMP and
+    # still gets the float16 speedup. Effective batch unchanged at 64.
+    batch_size: int = 8             # local batch per step
+    grad_accum_steps: int = 8       # virtual batch = 64
 
     # Gradient clipping
     max_grad_norm: float = 1.0
