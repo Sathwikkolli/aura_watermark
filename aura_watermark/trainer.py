@@ -549,8 +549,16 @@ class AURATrainer:
         self.discriminator.load_state_dict(ckpt["disc_state"])
         self.gen_opt.load_state_dict(ckpt["gen_opt"])
         self.disc_opt.load_state_dict(ckpt["disc_opt"])
-        self.gen_scaler.load_state_dict(ckpt["gen_scaler"])
-        self.disc_scaler.load_state_dict(ckpt["disc_scaler"])
+        # A GradScaler saved while AMP was disabled serialises an EMPTY dict;
+        # loading that into an enabled scaler raises ValueError. Only restore
+        # scaler state when it is non-empty (so we can flip AMP on across a
+        # resume — the enabled scaler just keeps its fresh default scale).
+        gen_scaler_state = ckpt.get("gen_scaler") or {}
+        if gen_scaler_state:
+            self.gen_scaler.load_state_dict(gen_scaler_state)
+        disc_scaler_state = ckpt.get("disc_scaler") or {}
+        if disc_scaler_state:
+            self.disc_scaler.load_state_dict(disc_scaler_state)
         self.attack_layer.curriculum.load_state_dict(ckpt["curriculum"])
 
     def prune_checkpoints(

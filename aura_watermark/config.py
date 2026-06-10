@@ -134,10 +134,12 @@ class TrainingConfig:
     stage1_steps: int = 70_000
 
     # --- precision ---
-    # Whole-graph AMP (float16) corrupts the small watermark signal and is the
-    # source of the NaN/Inf that crashed the LAME codec.  The paper assumes full
-    # precision; default to fp32.  113M params @ batch 32 fits A40 48 GB in fp32.
-    use_amp: bool = False
+    # AMP (float16) for speed + memory in Stage 2 (the BigVGAN discriminator is
+    # heavy and fp32 batch-8 is slow). Safe here because the watermark is now a
+    # trained, loud signal; the precision-sensitive perceptual losses are forced
+    # back to fp32 inside losses.py. (Stage 1 cold-start used fp32 to converge —
+    # if training from scratch, set this False until past the warmup.)
+    use_amp: bool = True
 
     # --- cold-start curriculum warmup (paper-faithful bootstrap) ---
     # The detector cannot decode at init, so all-22-attacks-from-step-0 with the
@@ -152,12 +154,12 @@ class TrainingConfig:
     lr_min: float = 1e-6            # cosine annealing floor
 
     # Batch / accumulation (A40 48 GB settings)
-    # batch 8×accum 8 = 64 effective. fp32 Stage 2 keeps 3-4 simultaneous
-    # BigVGAN MS-STFT discriminator graphs on raw 96k audio, which nearly fills
-    # the A40 regardless of a modest batch cut (batch 16 was ~0.2 GB over).
-    # batch 8 leaves ~20 GB headroom. Effective batch unchanged at 64.
-    batch_size: int = 8             # local batch per step
-    grad_accum_steps: int = 8       # virtual batch = 64
+    # With AMP on (use_amp=True), float16 activations roughly halve memory, so
+    # batch 16 fits with headroom (≈ fp32 batch 8) while halving the micro-steps
+    # vs batch 8 → faster. If running fp32 (use_amp=False), drop to batch 8 to
+    # avoid the Stage-2 discriminator OOM. Effective batch is 64 either way.
+    batch_size: int = 16            # local batch per step
+    grad_accum_steps: int = 4       # virtual batch = 64
 
     # Gradient clipping
     max_grad_norm: float = 1.0

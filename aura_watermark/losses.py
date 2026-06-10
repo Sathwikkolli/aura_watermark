@@ -112,10 +112,14 @@ class MultiResSTFTLoss(nn.Module):
         Returns:
             Scalar mean STFT loss over all scales.
         """
-        x0 = x_orig.squeeze(1)   # [B, T]
-        xw = x_wm.squeeze(1)
+        # Force fp32: under AMP these inputs are float16, but torch.stft + the
+        # log-magnitude term are precision-sensitive (and cuFFT is finicky in
+        # fp16). Casting here keeps the perceptual loss accurate regardless of
+        # autocast, at negligible cost.
+        x0 = x_orig.squeeze(1).float()   # [B, T]
+        xw = x_wm.squeeze(1).float()
 
-        total = x_orig.new_zeros(())
+        total = x0.new_zeros(())
         for i in range(len(self.scales)):
             M0 = self._stft_mag(x0, i)   # [B, F, T']
             Mw = self._stft_mag(xw, i)
@@ -318,8 +322,10 @@ class NMRLoss(nn.Module):
         Returns:
             Scalar NMR loss (mean over batch and Bark bands).
         """
-        x0   = x_orig.squeeze(1)              # [B, T]
-        noise = (x_wm - x_orig).squeeze(1)   # [B, T]
+        # Force fp32 (see MultiResSTFTLoss): the Bark-band power, log10 and
+        # masking-threshold math are precision-sensitive and use torch.stft.
+        x0   = x_orig.squeeze(1).float()              # [B, T]
+        noise = (x_wm - x_orig).squeeze(1).float()    # [B, T]
 
         # Power spectra
         P_signal = self._power_spectrum(x0)      # [B, F]
