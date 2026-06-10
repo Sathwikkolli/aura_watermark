@@ -152,11 +152,12 @@ class TrainingConfig:
     lr_min: float = 1e-6            # cosine annealing floor
 
     # Batch / accumulation (A40 48 GB settings)
-    # batch 16×accum 4 = 64 effective. Halved from 32×2 because fp32 Stage 2
-    # (BigVGAN discriminator: 3 fwd passes + its own backward/Adam on top of the
-    # generator graph) OOMs the A40 at batch 32. Effective batch is unchanged.
-    batch_size: int = 16            # local batch per step
-    grad_accum_steps: int = 4       # virtual batch = 64
+    # batch 8×accum 8 = 64 effective. fp32 Stage 2 keeps 3-4 simultaneous
+    # BigVGAN MS-STFT discriminator graphs on raw 96k audio, which nearly fills
+    # the A40 regardless of a modest batch cut (batch 16 was ~0.2 GB over).
+    # batch 8 leaves ~20 GB headroom. Effective batch unchanged at 64.
+    batch_size: int = 8             # local batch per step
+    grad_accum_steps: int = 8       # virtual batch = 64
 
     # Gradient clipping
     max_grad_norm: float = 1.0
