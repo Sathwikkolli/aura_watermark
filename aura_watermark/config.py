@@ -134,12 +134,10 @@ class TrainingConfig:
     stage1_steps: int = 70_000
 
     # --- precision ---
-    # AMP (float16) for speed + memory in Stage 2 (the BigVGAN discriminator is
-    # heavy and fp32 batch-8 is slow). Safe here because the watermark is now a
-    # trained, loud signal; the precision-sensitive perceptual losses are forced
-    # back to fp32 inside losses.py. (Stage 1 cold-start used fp32 to converge —
-    # if training from scratch, set this False until past the warmup.)
-    use_amp: bool = True
+    # fp32. AMP was tried for Stage-2 speed but coincided with a BER regression
+    # (0.077->0.15); reverted to remove float16 as a variable and restore the
+    # precision that produced BER 0.077. fp32 batch 8 fits Stage 2 (~10.8 s/step).
+    use_amp: bool = False
 
     # --- cold-start curriculum warmup (paper-faithful bootstrap) ---
     # The detector cannot decode at init, so all-22-attacks-from-step-0 with the
